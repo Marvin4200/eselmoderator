@@ -15,6 +15,12 @@ const { getGuildConfig } = require("../utils/config");
 const { parseBoolean } = require("../utils/valueParsers");
 const { sendServerLog } = require("../utils/serverLogger");
 const { getPool } = require("../utils/db");
+const { handleReactionRoleButton, handleReactionRoleSelect } = require("../utils/reactionRoles");
+
+function moduleEnabled(config, key, fallback = false) {
+    const modules = config.modules || {};
+    return parseBoolean(modules[key], fallback);
+}
 
 const commands = [
     new SlashCommandBuilder()
@@ -579,10 +585,18 @@ async function handleModCommand(interaction) {
 
 async function handleInteraction(interaction) {
     try {
-        if (!interaction.isChatInputCommand()) return;
+        if (interaction.isChatInputCommand()) {
+            if (interaction.commandName === "mod") {
+                return handleModCommand(interaction);
+            }
+            return;
+        }
 
-        if (interaction.commandName === "mod") {
-            return handleModCommand(interaction);
+        if (interaction.isButton?.() && interaction.customId?.startsWith("rr:")) {
+            return handleReactionRoleButton(interaction, { getGuildConfig, moduleEnabled, safeReply });
+        }
+        if (interaction.isStringSelectMenu?.() && interaction.customId?.startsWith("rrs:")) {
+            return handleReactionRoleSelect(interaction, { getGuildConfig, moduleEnabled, safeReply });
         }
     } catch (err) {
         if (err.code !== 10062 && err.code !== 40060) {
