@@ -6,6 +6,7 @@
  * gibt, die es gating -- Muster identisch zu fahrstuhl/services/botAPI.js.
  */
 
+const crypto = require('crypto');
 const express = require('express');
 const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, StringSelectMenuBuilder, PermissionsBitField } = require('discord.js');
 const APIResponse = require('./apiResponse');
@@ -103,7 +104,14 @@ class BotAPIServer {
                 return res.status(503).json(APIResponse.error('BOT_API_TOKEN is not configured', 'BOT_API_TOKEN_MISSING'));
             }
             const auth = req.headers.authorization || '';
-            if (auth !== `Bearer ${expectedToken}`) {
+            const expected = `Bearer ${expectedToken}`;
+            // Laengenabgleich vor timingSafeEqual, weil die Funktion bei unterschiedlicher
+            // Laenge wirft statt false zurueckzugeben -- der Laengenvergleich selbst leakt
+            // nichts Nuetzliches, da die erwartete Laenge oeffentlich (fixe Token-Laenge) ist.
+            const authBuf = Buffer.from(auth);
+            const expectedBuf = Buffer.from(expected);
+            const valid = authBuf.length === expectedBuf.length && crypto.timingSafeEqual(authBuf, expectedBuf);
+            if (!valid) {
                 return res.status(401).json(APIResponse.unauthorized('Invalid API token'));
             }
             next();
