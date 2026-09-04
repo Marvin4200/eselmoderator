@@ -147,6 +147,10 @@ class BotAPIServer {
                 .filter(c => c.type === 0 && !c.isThread?.())
                 .map(c => ({ id: c.id, name: c.name, position: c.position, parentId: c.parentId }))
                 .sort((a, b) => a.position - b.position);
+            const voiceChannels = guild.channels.cache
+                .filter(c => c.type === 2)
+                .map(c => ({ id: c.id, name: c.name, position: c.position, parentId: c.parentId }))
+                .sort((a, b) => a.position - b.position);
             const roles = guild.roles.cache
                 .filter(r => r.name !== '@everyone')
                 .map(r => ({ id: r.id, name: r.name, color: r.hexColor, position: r.position, managed: r.managed }))
@@ -157,6 +161,7 @@ class BotAPIServer {
                 guildName: guild.name,
                 categories,
                 channels,
+                voiceChannels,
                 roles,
             }, 'Guild context fetched', 'GUILD_CONTEXT_OK'));
         });
@@ -478,6 +483,16 @@ class BotAPIServer {
         // Muster + Logik 1:1 aus fahrstuhl/services/botAPI.js's Ticket-Routen (inkl. der
         // Multi-Panel-Unterstuetzung dieser Session), nur ohne die dashboard-spezifische
         // Zugriffspruefung (hier reicht der globale Bearer-Token).
+        this.app.get('/guilds/:guildId/tickets', async (req, res) => {
+            const guild = this.client.guilds.cache.get(req.params.guildId);
+            if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+            const config = getGuildConfig(guild.id);
+            const tickets = config.tickets && typeof config.tickets === 'object' ? config.tickets : {};
+            const panels = normalizeTicketPanels(tickets);
+            const stats = await ticketStore.getTicketStats(guild.id, { slaMinutes: tickets.slaMinutes || 240 }).catch(() => null);
+            res.json(APIResponse.success({ guildId: guild.id, tickets, panels, stats }, 'Ticket settings fetched', 'TICKETS_OK'));
+        });
+
         this.app.post('/guilds/:guildId/tickets', async (req, res) => {
             try {
                 const guild = this.client.guilds.cache.get(req.params.guildId);
