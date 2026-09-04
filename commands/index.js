@@ -18,6 +18,8 @@ const { getPool } = require("../utils/db");
 const { handleReactionRoleButton, handleReactionRoleSelect } = require("../utils/reactionRoles");
 const { tempVoiceChannels } = require("../utils/tempVoice");
 const levelingManager = require("../utils/levelingManager");
+const ticketManager = require("../utils/ticketManager");
+const { handleTicketInteraction } = require("../utils/ticketInteractions");
 
 function moduleEnabled(config, key, fallback = false) {
     const modules = config.modules || {};
@@ -260,6 +262,94 @@ const commands = [
             subcommand
                 .setName("resetserver")
                 .setDescription("Reset ALL leveling data for this server (cannot be undone)")
+        ),
+    new SlashCommandBuilder()
+        .setName("ticket")
+        .setDescription("🎫 Open, manage and close private support tickets")
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName("open")
+                .setDescription("Open a private support ticket")
+                .addStringOption(option =>
+                    option.setName("reason")
+                        .setDescription("What do you need help with?")
+                        .setRequired(false)
+                        .setMaxLength(120)
+                )
+                .addStringOption(option =>
+                    option.setName("priority")
+                        .setDescription("How urgent is this ticket?")
+                        .setRequired(false)
+                        .addChoices(
+                            { name: "Normal", value: "normal" },
+                            { name: "High", value: "high" },
+                            { name: "Low", value: "low" }
+                        )
+                )
+                .addStringOption(option =>
+                    option.setName("type")
+                        .setDescription("What kind of ticket is this?")
+                        .setRequired(false)
+                        .addChoices(
+                            { name: "Support", value: "Support" },
+                            { name: "Report", value: "Report" },
+                            { name: "Appeal", value: "Appeal" },
+                            { name: "Partnership", value: "Partnership" },
+                            { name: "Other", value: "Other" }
+                        )
+                )
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName("close")
+                .setDescription("Close this ticket channel")
+                .addStringOption(option =>
+                    option.setName("reason")
+                        .setDescription("Why is this ticket being closed?")
+                        .setRequired(false)
+                        .setMaxLength(160)
+                )
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName("note")
+                .setDescription("Add an internal staff note to this ticket")
+                .addStringOption(option =>
+                    option.setName("text")
+                        .setDescription("Internal note for the ticket archive")
+                        .setRequired(true)
+                        .setMaxLength(1000)
+                )
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName("adduser")
+                .setDescription("Give another member access to this ticket")
+                .addUserOption(option =>
+                    option.setName("user")
+                        .setDescription("Member to add")
+                        .setRequired(true)
+                )
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName("removeuser")
+                .setDescription("Remove a directly added member from this ticket")
+                .addUserOption(option =>
+                    option.setName("user")
+                        .setDescription("Member to remove")
+                        .setRequired(true)
+                )
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName("claim")
+                .setDescription("Claim this ticket as the handling staff member")
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName("unclaim")
+                .setDescription("Release this ticket back to the team")
         ),
 ];
 
@@ -859,6 +949,48 @@ async function handleLevelingAdminCommand(interaction) {
     }
 }
 
+// 1:1 aus fahrstuhl/commands/index.js (ticket-Block) uebernommen.
+async function handleTicketCommand(interaction) {
+    const config = getGuildConfig(interaction.guildId);
+    if (!moduleEnabled(config, "tickets", false)) {
+        return safeReply(interaction, {
+            content: "🎫 Tickets are disabled on this server. Enable them in the EselModerator Dashboard under Modules.",
+            flags: [MessageFlags.Ephemeral],
+        });
+    }
+
+    const settings = config.tickets || {};
+    const subcommand = interaction.options.getSubcommand();
+    if (subcommand === "open") {
+        const reason = interaction.options.getString("reason") || "No reason provided";
+        const priority = interaction.options.getString("priority") || settings.defaultPriority || "normal";
+        return ticketManager.openTicket(interaction, config, {
+            reason,
+            priority,
+            typeLabel: interaction.options.getString("type") || "Support",
+        });
+    }
+    if (subcommand === "close") {
+        const reason = interaction.options.getString("reason") || "";
+        return ticketManager.closeTicket(interaction, config, { reason });
+    }
+    if (subcommand === "note") {
+        return ticketManager.addTicketNote(interaction, config, interaction.options.getString("text"));
+    }
+    if (subcommand === "adduser") {
+        return ticketManager.addTicketUser(interaction, config, interaction.options.getUser("user"));
+    }
+    if (subcommand === "removeuser") {
+        return ticketManager.removeTicketUser(interaction, config, interaction.options.getUser("user"));
+    }
+    if (subcommand === "claim") {
+        return ticketManager.claimTicket(interaction, config);
+    }
+    if (subcommand === "unclaim") {
+        return ticketManager.unclaimTicket(interaction, config);
+    }
+}
+
 async function handleInteraction(interaction) {
     try {
         if (interaction.isChatInputCommand()) {
@@ -877,8 +1009,14 @@ async function handleInteraction(interaction) {
             if (interaction.commandName === "leveling") {
                 return handleLevelingAdminCommand(interaction);
             }
+            if (interaction.commandName === "ticket") {
+                return handleTicketCommand(interaction);
+            }
             return;
         }
+
+        const handledAsTicket = await handleTicketInteraction(interaction, { getGuildConfig, moduleEnabled, safeReply });
+        if (handledAsTicket) return;
 
         if (interaction.isButton?.() && interaction.customId?.startsWith("rr:")) {
             return handleReactionRoleButton(interaction, { getGuildConfig, moduleEnabled, safeReply });

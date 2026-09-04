@@ -11,6 +11,70 @@ const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, StringSelect
 const APIResponse = require('./apiResponse');
 const { getGuildConfig, setGuildConfig } = require('../utils/config');
 const { normalizeReactionRoleRows, normalizeReactionRolePanels } = require('../utils/reactionRoles');
+const {
+    buildTicketPanel,
+    colorToHex,
+    normalizeTicketPanelInfo,
+    normalizeTicketPanels,
+    normalizeTicketSlaMinutes,
+    normalizeTicketTypes,
+    resolveTicketPanelDesign,
+} = require('../utils/ticketPanel');
+const ticketStore = require('../utils/ticketStore');
+
+function discordImageUrl(value) {
+    const url = String(value || '').trim();
+    return /^https?:\/\//i.test(url) ? url.slice(0, 500) : '';
+}
+
+function booleanWithDefault(value, fallback = false) {
+    const { parseBoolean } = require('../utils/valueParsers');
+    return parseBoolean(value, fallback);
+}
+
+function ticketPanelBoolean(bodyValue, existingValue, fallback) {
+    const source = bodyValue === undefined || bodyValue === null ? existingValue : bodyValue;
+    return booleanWithDefault(source, fallback);
+}
+
+// Panel-Design liegt im selben Config-Blob wie die Verhaltens-Einstellungen -- Settings-Route
+// und Panel-Deploy-Route loesen es beide gleich auf.
+function ticketPanelSettingsFromBody(body = {}, existing = {}) {
+    const current = existing && typeof existing === 'object' ? existing : {};
+    const design = resolveTicketPanelDesign(current);
+    const text = (value, fallbackValue, maxLength) => {
+        const raw = String(value ?? '').trim();
+        return (raw || fallbackValue).slice(0, maxLength);
+    };
+    return {
+        panelTitle: text(body?.panelTitle, design.title, 120),
+        panelDescription: text(body?.panelDescription, design.description, 1200),
+        panelButtonLabel: text(body?.panelButtonLabel, design.buttonLabel, 80),
+        panelPlaceholder: text(body?.panelPlaceholder, design.placeholder, 150),
+        panelFooterText: text(body?.panelFooterText, design.footerText, 2048),
+        panelBrandName: text(body?.panelBrandName, design.brandName, 100),
+        panelBannerUrl: discordImageUrl(body?.panelBannerUrl ?? current.panelBannerUrl ?? ''),
+        panelColor: colorToHex(body?.panelColor ?? current.panelColor),
+        panelShowLiveStatus: ticketPanelBoolean(body?.panelShowLiveStatus, current.panelShowLiveStatus, true),
+        panelShowStaffOnline: ticketPanelBoolean(body?.panelShowStaffOnline, current.panelShowStaffOnline, true),
+        panelShowQueue: ticketPanelBoolean(body?.panelShowQueue, current.panelShowQueue, true),
+        panelShowRating: ticketPanelBoolean(body?.panelShowRating, current.panelShowRating, true),
+    };
+}
+
+// Verweise auf geloeschte Kanaele/Rollen stillschweigend entfernen statt den ganzen Save
+// abzulehnen, wenn z.B. eine Staff-Rolle auf Discord-Seite geloescht wurde.
+function sanitizeTicketCategoriesForGuild(guild, rawCategories) {
+    return normalizeTicketTypes(rawCategories).map(category => ({
+        ...category,
+        categoryId: category.categoryId && guild.channels.cache.get(category.categoryId)?.type === 4
+            ? category.categoryId
+            : null,
+        staffRoleId: category.staffRoleId && guild.roles.cache.has(category.staffRoleId)
+            ? category.staffRoleId
+            : null,
+    }));
+}
 
 class BotAPIServer {
     constructor(client) {
@@ -148,6 +212,158 @@ class BotAPIServer {
                 }, 'Reaction role panel sent', 'REACTION_ROLE_PANEL_SENT'));
             } catch (error) {
                 res.status(500).json(APIResponse.error(error.message, 'REACTION_ROLE_PANEL_SEND_FAILED'));
+            }
+        });
+
+        // Minimale Ticket-Verwaltungs-API, solange es noch kein eigenes Dashboard gibt --
+        // Muster + Logik 1:1 aus fahrstuhl/services/botAPI.js's Ticket-Routen (inkl. der
+        // Multi-Panel-Unterstuetzung dieser Session), nur ohne die dashboard-spezifische
+        // Zugriffspruefung (hier reicht der globale Bearer-Token).
+        this.app.post('/guilds/:guildId/tickets', async (req, res) => {
+            try {
+                const guild = this.client.guilds.cache.get(req.params.guildId);
+                if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+
+                const categoryId = String(req.body?.categoryId || '').trim();
+                const staffRoleId = String(req.body?.staffRoleId || '').trim();
+                const transcriptChannelId = String(req.body?.transcriptChannelId || '').trim();
+                if (categoryId && guild.channels.cache.get(categoryId)?.type !== 4) {
+                    return res.status(400).json(APIResponse.badRequest('Ticket category not found'));
+                }
+                if (transcriptChannelId && guild.channels.cache.get(transcriptChannelId)?.type !== 0) {
+                    return res.status(400).json(APIResponse.badRequest('Transcript channel not found'));
+                }
+                if (staffRoleId && !guild.roles.cache.has(staffRoleId)) {
+                    return res.status(400).json(APIResponse.badRequest('Staff role not found'));
+                }
+
+                const config = getGuildConfig(guild.id);
+                const tickets = {
+                    ...(config.tickets || {}),
+                    categoryId: categoryId || null,
+                    staffRoleId: staffRoleId || null,
+                    transcriptChannelId: transcriptChannelId || null,
+                    defaultPriority: ['low', 'normal', 'high'].includes(req.body?.defaultPriority) ? req.body.defaultPriority : 'normal',
+                    closeDelaySeconds: Math.max(1, Math.min(30, Number(req.body?.closeDelaySeconds) || 5)),
+                    slaMinutes: normalizeTicketSlaMinutes(req.body?.slaMinutes, 240),
+                    requireCloseReason: booleanWithDefault(req.body?.requireCloseReason, false),
+                    enableClaiming: booleanWithDefault(req.body?.enableClaiming, true),
+                    enableTicketTypes: booleanWithDefault(req.body?.enableTicketTypes, false),
+                    ticketTypes: sanitizeTicketCategoriesForGuild(guild, req.body?.ticketTypes),
+                    ...ticketPanelSettingsFromBody(req.body, config.tickets),
+                    ticketPanelInfo: normalizeTicketPanelInfo(req.body?.ticketPanelInfo || config.tickets?.ticketPanelInfo),
+                };
+                setGuildConfig(guild.id, { tickets });
+
+                const deployedPanels = normalizeTicketPanels(tickets);
+                if (deployedPanels.length) {
+                    const panelStats = await ticketStore.getTicketStats(guild.id, { slaMinutes: tickets.slaMinutes });
+                    const panel = buildTicketPanel({ guild, settings: tickets, ticketStats: panelStats });
+                    for (const { channelId, messageId } of deployedPanels) {
+                        const panelChannel = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
+                        if (!panelChannel?.isTextBased?.()) continue;
+                        const panelMessage = await panelChannel.messages.fetch(messageId).catch(() => null);
+                        if (panelMessage) await panelMessage.edit(panel).catch(() => {});
+                    }
+                }
+
+                res.json(APIResponse.success({ guildId: guild.id, tickets }, 'Ticket settings updated', 'TICKET_SETTINGS_UPDATED'));
+            } catch (error) {
+                res.status(500).json(APIResponse.error(error.message, 'TICKET_SETTINGS_UPDATE_FAILED'));
+            }
+        });
+
+        this.app.post('/guilds/:guildId/tickets/panel', async (req, res) => {
+            try {
+                const guild = this.client.guilds.cache.get(req.params.guildId);
+                if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+
+                const config = getGuildConfig(guild.id);
+                const channelId = String(req.body?.channelId || '').trim();
+                const channel = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
+                if (!channel || !channel.isTextBased?.()) {
+                    return res.status(400).json(APIResponse.badRequest('Kanal nicht gefunden oder kein Text-Kanal'));
+                }
+                const botMember = guild.members.me || await guild.members.fetchMe().catch(() => null);
+                if (botMember) {
+                    const perms = channel.permissionsFor(botMember);
+                    if (!perms?.has('SendMessages')) return res.status(400).json(APIResponse.badRequest('EselModerator hat keine Schreibberechtigung in diesem Kanal'));
+                    if (!perms?.has('EmbedLinks')) return res.status(400).json(APIResponse.badRequest('EselModerator benötigt die Berechtigung "Links einbetten" in diesem Kanal'));
+                }
+
+                const incomingTicketSettings = {
+                    categoryId: String(req.body?.categoryId || '').trim() || null,
+                    staffRoleId: String(req.body?.staffRoleId || '').trim() || null,
+                    transcriptChannelId: String(req.body?.transcriptChannelId || '').trim() || null,
+                    defaultPriority: ['low', 'normal', 'high'].includes(req.body?.defaultPriority) ? req.body.defaultPriority : 'normal',
+                    closeDelaySeconds: Math.max(1, Math.min(30, Number(req.body?.closeDelaySeconds) || 5)),
+                    slaMinutes: normalizeTicketSlaMinutes(req.body?.slaMinutes, 240),
+                    requireCloseReason: booleanWithDefault(req.body?.requireCloseReason, false),
+                    enableClaiming: booleanWithDefault(req.body?.enableClaiming, true),
+                    enableTicketTypes: booleanWithDefault(req.body?.enableTicketTypes, false),
+                    ticketTypes: sanitizeTicketCategoriesForGuild(guild, req.body?.ticketTypes),
+                    ticketPanelInfo: normalizeTicketPanelInfo(req.body?.ticketPanelInfo || config.tickets?.ticketPanelInfo),
+                };
+                const settings = {
+                    ...(config.tickets && typeof config.tickets === 'object' ? config.tickets : {}),
+                    ...incomingTicketSettings,
+                    ...ticketPanelSettingsFromBody(req.body, config.tickets),
+                };
+                const panelStats = await ticketStore.getTicketStats(guild.id, { slaMinutes: settings.slaMinutes });
+                const panel = buildTicketPanel({ guild, settings, ticketStats: panelStats });
+
+                // Ein Server kann mehrere Panels haben (eins pro Kanal); erneutes Senden in
+                // einen Kanal mit bereits aktivem Panel aktualisiert dieses statt ein neues
+                // zu zaehlen. Kein Limit-Check hier (anders als bei fahrstuhl) -- kommt mit
+                // den echten Premium-Tier-Definitionen in einer spaeteren Runde.
+                const existingPanels = normalizeTicketPanels(config.tickets);
+                const existingPanelIndex = existingPanels.findIndex(p => p.channelId === channel.id);
+                const isNewPanelDeployment = existingPanelIndex === -1;
+
+                let message = null;
+                if (!isNewPanelDeployment) {
+                    const existingMsg = await channel.messages.fetch(existingPanels[existingPanelIndex].messageId).catch(() => null);
+                    if (existingMsg) message = await existingMsg.edit(panel).catch(() => null);
+                }
+                if (!message) message = await channel.send(panel);
+
+                const updatedPanels = [...existingPanels];
+                if (isNewPanelDeployment) updatedPanels.push({ channelId: channel.id, messageId: message.id });
+                else updatedPanels[existingPanelIndex] = { channelId: channel.id, messageId: message.id };
+
+                setGuildConfig(guild.id, { tickets: { ...settings, panels: updatedPanels } });
+
+                res.json(APIResponse.success({
+                    guildId: guild.id, channelId: channel.id, messageId: message.id, url: message.url,
+                }, 'Ticket panel sent', 'TICKET_PANEL_SENT'));
+            } catch (error) {
+                res.status(500).json(APIResponse.error(error.message, 'TICKET_PANEL_SEND_FAILED'));
+            }
+        });
+
+        this.app.post('/guilds/:guildId/tickets/panel/remove', async (req, res) => {
+            try {
+                const guild = this.client.guilds.cache.get(req.params.guildId);
+                if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+
+                const channelId = String(req.body?.channelId || '').trim();
+                const config = getGuildConfig(guild.id);
+                const existingPanels = normalizeTicketPanels(config.tickets);
+                const target = existingPanels.find(p => p.channelId === channelId);
+                if (!target) return res.status(404).json(APIResponse.notFound('Kein Panel in diesem Kanal gefunden'));
+
+                const channel = guild.channels.cache.get(target.channelId) || await guild.channels.fetch(target.channelId).catch(() => null);
+                if (channel?.isTextBased?.()) {
+                    const message = await channel.messages.fetch(target.messageId).catch(() => null);
+                    if (message) await message.delete().catch(() => {});
+                }
+
+                const remainingPanels = existingPanels.filter(p => p.channelId !== channelId);
+                setGuildConfig(guild.id, { tickets: { ...(config.tickets || {}), panels: remainingPanels } });
+
+                res.json(APIResponse.success({ guildId: guild.id, channelId, remaining: remainingPanels.length }, 'Ticket panel removed', 'TICKET_PANEL_REMOVED'));
+            } catch (error) {
+                res.status(500).json(APIResponse.error(error.message, 'TICKET_PANEL_REMOVE_FAILED'));
             }
         });
     }

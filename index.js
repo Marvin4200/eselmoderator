@@ -27,6 +27,7 @@ const {
     syncLevelRoles,
     syncLevelRolesForMember,
 } = require("./utils/leveling");
+const ticketManager = require("./utils/ticketManager");
 const premiumManager = require("./utils/premiumManager");
 const BotAPIServer = require("./services/botAPI");
 const { commands, handleInteraction } = require("./commands/index");
@@ -367,6 +368,21 @@ const levelingMapsCleanup = setInterval(() => {
     cleanupPremiumXpCache();
 }, 30 * 60 * 1000);
 activeIntervals.push(levelingMapsCleanup);
+
+// Ticket-Panels: Live-Status alle 5 Minuten aktualisieren, gleiches Muster wie bei fahrstuhl
+// diese Session eingefuehrt (Staff-Online/Queue aendert sich sonst nur bei Ticket-Events).
+const ticketPanelRefresh = setInterval(async () => {
+    for (const [guildId, guild] of client.guilds.cache) {
+        try {
+            const config = getGuildConfig(guildId);
+            if (!config.tickets?.panels?.length && !(config.tickets?.panelChannelId && config.tickets?.panelMessageId)) continue;
+            await ticketManager.refreshTicketPanel(guild, config);
+        } catch (err) {
+            console.error(`Ticket panel refresh failed for guild ${guildId}:`, err.message);
+        }
+    }
+}, 5 * 60 * 1000);
+activeIntervals.push(ticketPanelRefresh);
 
 // Alte Strike-Eintraege regelmaessig aufraeumen (24h-Fenster), damit die Map nicht unbegrenzt waechst.
 const autoModCleanup = setInterval(() => {

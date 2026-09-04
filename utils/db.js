@@ -80,6 +80,43 @@ async function initDb({ host, port, user, password, database }) {
         )
     `);
 
+    // Tickets (Ticket-Modul) -- Schema aus der ECHTEN Live-Tabelle bei fahrstuhl uebernommen
+    // (per DESCRIBE geprueft), nicht aus fahrstuhl/utils/db.js's CREATE-TABLE-Statement: das
+    // deklariert dort faelschlich keine channel_id-Spalte/PRIMARY KEY, obwohl die Live-Tabelle
+    // (und ticketStore.js's Queries) sie zwingend brauchen -- ein Doku/Code-Drift bei fahrstuhl,
+    // der dort nur deshalb nie auffiel, weil CREATE TABLE IF NOT EXISTS die laengst bestehende
+    // Tabelle nie neu anlegt/validiert. Fuer eine frische Installation hier korrekt nachgebaut.
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS ticket_records (
+            channel_id VARCHAR(32) PRIMARY KEY,
+            guild_id VARCHAR(32) NOT NULL,
+            owner_id VARCHAR(32) NOT NULL,
+            owner_tag VARCHAR(120) DEFAULT NULL,
+            type VARCHAR(80) NOT NULL DEFAULT 'Support',
+            priority VARCHAR(24) NOT NULL DEFAULT 'normal',
+            status VARCHAR(32) NOT NULL DEFAULT 'open',
+            claimed_by VARCHAR(32) DEFAULT NULL,
+            opened_by VARCHAR(32) DEFAULT NULL,
+            closed_by VARCHAR(32) DEFAULT NULL,
+            reason TEXT,
+            close_reason TEXT,
+            internal_notes LONGTEXT,
+            feedback_rating INT DEFAULT NULL,
+            feedback_user_id VARCHAR(32) DEFAULT NULL,
+            feedback_comment TEXT,
+            feedback_at BIGINT DEFAULT NULL,
+            opened_at BIGINT NOT NULL,
+            closed_at BIGINT DEFAULT NULL,
+            transcript_channel_id VARCHAR(32) DEFAULT NULL,
+            transcript_message_id VARCHAR(32) DEFAULT NULL,
+            updated_at BIGINT NOT NULL,
+            INDEX idx_ticket_guild_status (guild_id, status),
+            INDEX idx_ticket_guild_opened (guild_id, opened_at),
+            INDEX idx_ticket_owner (guild_id, owner_id),
+            INDEX idx_ticket_claimed (guild_id, claimed_by)
+        )
+    `);
+
     // Server-Event-Logs (Logging-Modul) -- Schema 1:1 aus fahrstuhl/utils/db.js.
     await pool.query(`
         CREATE TABLE IF NOT EXISTS server_log_events (
