@@ -16,6 +16,7 @@ const {
     applyAutoModPunishment,
     applyAutoModRuleAction,
 } = require("./utils/automod");
+const { sendConfiguredWelcome } = require("./utils/welcome");
 const premiumManager = require("./utils/premiumManager");
 const BotAPIServer = require("./services/botAPI");
 const { commands, handleInteraction } = require("./commands/index");
@@ -31,9 +32,12 @@ const autoModStrikeMap = new Map();
 // AutoMod braucht Nachrichteninhalte -> MessageContent-Intent (privilegiert, muss im Discord
 // Developer Portal unter Bot -> Privileged Gateway Intents -> "Message Content Intent"
 // eingeschaltet werden, sonst ist message.content bei Guild-Nachrichten immer leer).
+// Welcome/Goodbye braucht guildMemberAdd/Remove -> GuildMembers-Intent (ebenfalls
+// privilegiert, gleicher Schalter im Developer Portal wie Message Content).
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMembers,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
     ],
@@ -154,6 +158,43 @@ client.on(Events.MessageCreate, async (message) => {
     } catch (err) {
         console.error("AutoMod handler error:", err);
     }
+});
+
+// Welcome/Goodbye -- 1:1 aus fahrstuhl/index.js's guildMemberAdd/guildMemberRemove uebernommen
+// (ohne die Live-Dashboard-Events und die Kick-vs-Leave-Audit-Log-Unterscheidung, die als
+// Feinschliff spaeter nachgezogen werden kann).
+client.on(Events.GuildMemberAdd, async (member) => {
+    const config = getGuildConfig(member.guild.id);
+    sendConfiguredWelcome(member, "join", config).catch(error => {
+        console.warn(`⚠️ Welcome message failed in ${member.guild.name}: ${error.message}`);
+    });
+    sendServerLog(member.guild, config, "memberJoin", {
+        title: "Member Joined",
+        description: `${member.user} joined the server.`,
+        color: 0x51cf66,
+        thumbnail: member.user.displayAvatarURL({ size: 128 }),
+        fields: [
+            { name: "User", value: `${member.user.username}\n\`${member.id}\``, inline: true },
+            { name: "Account Created", value: `<t:${Math.floor(member.user.createdTimestamp / 1000)}:R>`, inline: true },
+            { name: "Members", value: String(member.guild.memberCount || "unknown"), inline: true },
+        ],
+    }).catch(() => {});
+});
+
+client.on(Events.GuildMemberRemove, async (member) => {
+    const config = getGuildConfig(member.guild.id);
+    sendConfiguredWelcome(member, "leave", config).catch(error => {
+        console.warn(`⚠️ Goodbye message failed in ${member.guild.name}: ${error.message}`);
+    });
+    sendServerLog(member.guild, config, "memberLeave", {
+        title: "Member Left",
+        description: `${member.user} left the server.`,
+        color: 0xff6b6b,
+        thumbnail: member.user.displayAvatarURL({ size: 128 }),
+        fields: [
+            { name: "User", value: `${member.user.username}\n\`${member.id}\``, inline: true },
+        ],
+    }).catch(() => {});
 });
 
 // Alte Strike-Eintraege regelmaessig aufraeumen (24h-Fenster), damit die Map nicht unbegrenzt waechst.
