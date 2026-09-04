@@ -428,6 +428,233 @@ class BotAPIServer {
             }
         });
 
+        // ============ DISCORD SERVER BACKUPS ============
+        // 1:1 aus fahrstuhl/services/botAPI.js uebernommen, nur ohne den dort zusaetzlichen
+        // getDashboardGuildAccess()-Check -- der globale Bearer-Token + die PHP-seitige
+        // isServerAdmin()-Pruefung im Dashboard reichen hier wie bei allen anderen Routen.
+
+        this.app.get('/guilds/:guildId/discord-backups', async (req, res) => {
+            try {
+                const guild = this.client.guilds.cache.get(req.params.guildId);
+                if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+                const { listGuildBackups } = require('../utils/serverBackup');
+                const backups = await listGuildBackups(guild.id);
+                res.json(APIResponse.success({ backups, total: backups.length }, 'Backups listed', 'DISCORD_BACKUPS_LIST'));
+            } catch (error) {
+                res.status(500).json(APIResponse.error(error.message, 'DISCORD_BACKUPS_LIST_FAILED'));
+            }
+        });
+
+        this.app.get('/guilds/:guildId/discord-backups/schedule', async (req, res) => {
+            try {
+                const guild = this.client.guilds.cache.get(req.params.guildId);
+                if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+                const { getBackupSchedule } = require('../utils/serverBackup');
+                const schedule = await getBackupSchedule(guild.id);
+                res.json(APIResponse.success(schedule, 'Backup schedule fetched', 'DISCORD_BACKUP_SCHEDULE_GET'));
+            } catch (error) {
+                res.status(500).json(APIResponse.error(error.message, 'DISCORD_BACKUP_SCHEDULE_GET_FAILED'));
+            }
+        });
+
+        this.app.post('/guilds/:guildId/discord-backups/schedule', async (req, res) => {
+            try {
+                const guild = this.client.guilds.cache.get(req.params.guildId);
+                if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+                const { upsertBackupSchedule } = require('../utils/serverBackup');
+                const updatedBy = String(req.get('x-dashboard-user-id') || '').trim() || null;
+                const schedule = await upsertBackupSchedule(guild.id, {
+                    enabled: req.body?.enabled === true,
+                    intervalHours: Number(req.body?.intervalHours || 24),
+                    retentionCount: Number(req.body?.retentionCount || 10),
+                    backupMode: String(req.body?.backupMode || 'full').toLowerCase(),
+                }, updatedBy);
+                res.json(APIResponse.success(schedule, 'Backup schedule updated', 'DISCORD_BACKUP_SCHEDULE_SET'));
+            } catch (error) {
+                res.status(500).json(APIResponse.error(error.message, 'DISCORD_BACKUP_SCHEDULE_SET_FAILED'));
+            }
+        });
+
+        this.app.post('/guilds/:guildId/discord-backups/create', async (req, res) => {
+            try {
+                const guild = this.client.guilds.cache.get(req.params.guildId);
+                if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+                const { createBackupJob, createServerBackup } = require('../utils/serverBackup');
+                const botConfig = getGuildConfig(guild.id);
+                const createdBy = String(req.get('x-dashboard-user-id') || '').trim() || null;
+                const jobId = await createBackupJob(guild.id);
+                // Sofort antworten -- Backup laeuft im Hintergrund (vermeidet Timeout bei grossen Servern).
+                res.json(APIResponse.success({ status: 'queued', jobId }, 'Backup wird im Hintergrund erstellt', 'DISCORD_BACKUP_QUEUED'));
+                createServerBackup(guild, botConfig, createdBy, jobId).catch(err => {
+                    console.error('[ServerBackup] Background backup failed:', err);
+                });
+            } catch (error) {
+                res.status(500).json(APIResponse.error(error.message, 'DISCORD_BACKUP_CREATE_FAILED'));
+            }
+        });
+
+        this.app.get('/guilds/:guildId/backup-jobs/:jobId', async (req, res) => {
+            try {
+                const guild = this.client.guilds.cache.get(req.params.guildId);
+                if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+                const jobId = parseInt(req.params.jobId, 10);
+                if (!Number.isFinite(jobId) || jobId < 1) return res.status(400).json(APIResponse.badRequest('Invalid job ID'));
+                const { getBackupJob } = require('../utils/serverBackup');
+                const job = await getBackupJob(jobId);
+                if (!job || job.guildId !== guild.id) return res.status(404).json(APIResponse.notFound('Job not found'));
+                res.json(APIResponse.success(job, 'Job status', 'BACKUP_JOB_STATUS'));
+            } catch (error) {
+                res.status(500).json(APIResponse.error(error.message, 'BACKUP_JOB_STATUS_FAILED'));
+            }
+        });
+
+        this.app.get('/guilds/:guildId/backup-jobs/latest', async (req, res) => {
+            try {
+                const guild = this.client.guilds.cache.get(req.params.guildId);
+                if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+                const { getLatestRunningBackupJob } = require('../utils/serverBackup');
+                const job = await getLatestRunningBackupJob(guild.id);
+                if (!job) return res.status(404).json(APIResponse.notFound('No running job'));
+                res.json(APIResponse.success(job, 'Latest running backup job', 'BACKUP_JOB_LATEST'));
+            } catch (error) {
+                res.status(500).json(APIResponse.error(error.message, 'BACKUP_JOB_LATEST_FAILED'));
+            }
+        });
+
+        this.app.get('/guilds/:guildId/discord-backups/:backupId', async (req, res) => {
+            try {
+                const guild = this.client.guilds.cache.get(req.params.guildId);
+                if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+                const backupId = parseInt(req.params.backupId, 10);
+                if (!Number.isFinite(backupId) || backupId < 1) return res.status(400).json(APIResponse.badRequest('Invalid backup ID'));
+                const { getBackupById } = require('../utils/serverBackup');
+                const backup = await getBackupById(backupId, guild.id);
+                if (!backup) return res.status(404).json(APIResponse.notFound('Backup not found'));
+                const filename = `discord-backup-${guild.id}-${backup.meta.createdAt}.json`;
+                res.setHeader('Content-Type', 'application/json');
+                res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+                res.send(JSON.stringify(backup, null, 2));
+            } catch (error) {
+                res.status(500).json(APIResponse.error(error.message, 'DISCORD_BACKUP_DOWNLOAD_FAILED'));
+            }
+        });
+
+        this.app.delete('/guilds/:guildId/discord-backups/:backupId', async (req, res) => {
+            try {
+                const guild = this.client.guilds.cache.get(req.params.guildId);
+                if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+                const backupId = parseInt(req.params.backupId, 10);
+                if (!Number.isFinite(backupId) || backupId < 1) return res.status(400).json(APIResponse.badRequest('Invalid backup ID'));
+                const { deleteBackup } = require('../utils/serverBackup');
+                const deleted = await deleteBackup(backupId, guild.id);
+                if (!deleted) return res.status(404).json(APIResponse.notFound('Backup not found'));
+                res.json(APIResponse.success({ backupId }, 'Backup deleted', 'DISCORD_BACKUP_DELETED'));
+            } catch (error) {
+                res.status(500).json(APIResponse.error(error.message, 'DISCORD_BACKUP_DELETE_FAILED'));
+            }
+        });
+
+        this.app.post('/guilds/:guildId/discord-backups/restore', async (req, res) => {
+            try {
+                const guild = this.client.guilds.cache.get(req.params.guildId);
+                if (!guild) return res.status(404).json(APIResponse.notFound('Target guild not found or bot is not in it'));
+                const backupId = parseInt(req.body?.backupId, 10);
+                if (!Number.isFinite(backupId) || backupId < 1) return res.status(400).json(APIResponse.badRequest('Invalid backup ID'));
+                const { getBackupMetaById } = require('../utils/serverBackup');
+                const backupMeta = await getBackupMetaById(backupId);
+                if (!backupMeta) return res.status(404).json(APIResponse.notFound('Backup not found'));
+                const options = {
+                    settings: req.body?.options?.settings === true,
+                    roles: req.body?.options?.roles !== false,
+                    channels: req.body?.options?.channels !== false,
+                    emojis: req.body?.options?.emojis === true,
+                    messages: req.body?.options?.messages !== false,
+                    autoVerify: req.body?.options?.autoVerify !== false,
+                    wipeExisting: req.body?.options?.wipeExisting === true,
+                    messageMode: String(req.body?.options?.messageMode || 'embed').toLowerCase(),
+                    sourceGuildId: backupMeta.guildId,
+                };
+                const { createRestoreJob, restoreServerBackup } = require('../utils/serverBackup');
+                const jobId = await createRestoreJob(backupId, guild.id);
+                res.json(APIResponse.success({ status: 'queued', jobId, targetGuild: guild.name, sourceGuildId: backupMeta.guildId }, 'Restore wird im Hintergrund ausgeführt', 'DISCORD_BACKUP_RESTORE_QUEUED'));
+                restoreServerBackup(guild, backupId, options, jobId).catch(err => {
+                    console.error('[ServerBackup] Background restore failed:', err);
+                });
+            } catch (error) {
+                res.status(500).json(APIResponse.error(error.message, 'DISCORD_BACKUP_RESTORE_FAILED'));
+            }
+        });
+
+        this.app.post('/guilds/:guildId/discord-backups/restore-preview', async (req, res) => {
+            try {
+                const guild = this.client.guilds.cache.get(req.params.guildId);
+                if (!guild) return res.status(404).json(APIResponse.notFound('Target guild not found or bot is not in it'));
+                const backupId = parseInt(req.body?.backupId, 10);
+                if (!Number.isFinite(backupId) || backupId < 1) return res.status(400).json(APIResponse.badRequest('Invalid backup ID'));
+                const { getBackupMetaById, getRestorePreview } = require('../utils/serverBackup');
+                const backupMeta = await getBackupMetaById(backupId);
+                if (!backupMeta) return res.status(404).json(APIResponse.notFound('Backup not found'));
+                const options = {
+                    settings: req.body?.options?.settings === true,
+                    roles: req.body?.options?.roles !== false,
+                    channels: req.body?.options?.channels !== false,
+                    emojis: req.body?.options?.emojis === true,
+                    messages: req.body?.options?.messages !== false,
+                    autoVerify: req.body?.options?.autoVerify !== false,
+                    wipeExisting: req.body?.options?.wipeExisting === true,
+                    sourceGuildId: backupMeta.guildId,
+                };
+                const preview = await getRestorePreview(guild, backupId, options);
+                res.json(APIResponse.success(preview, 'Restore preview generated', 'DISCORD_BACKUP_RESTORE_PREVIEW'));
+            } catch (error) {
+                res.status(500).json(APIResponse.error(error.message, 'DISCORD_BACKUP_RESTORE_PREVIEW_FAILED'));
+            }
+        });
+
+        this.app.post('/guilds/:guildId/discord-backups/verify', async (req, res) => {
+            try {
+                const guild = this.client.guilds.cache.get(req.params.guildId);
+                if (!guild) return res.status(404).json(APIResponse.notFound('Target guild not found'));
+                const backupId = parseInt(req.body?.backupId, 10);
+                if (!Number.isFinite(backupId) || backupId < 1) return res.status(400).json(APIResponse.badRequest('Invalid backup ID'));
+                const { getBackupMetaById, verifyRestoreOutcome } = require('../utils/serverBackup');
+                const backupMeta = await getBackupMetaById(backupId);
+                if (!backupMeta) return res.status(404).json(APIResponse.notFound('Backup not found'));
+                const report = await verifyRestoreOutcome(guild, backupId, { sourceGuildId: backupMeta.guildId });
+                res.json(APIResponse.success(report, 'Restore verification generated', 'DISCORD_BACKUP_VERIFY_OK'));
+            } catch (error) {
+                res.status(500).json(APIResponse.error(error.message, 'DISCORD_BACKUP_VERIFY_FAILED'));
+            }
+        });
+
+        this.app.get('/guilds/:guildId/restore-jobs/:jobId', async (req, res) => {
+            try {
+                const guild = this.client.guilds.cache.get(req.params.guildId);
+                if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+                const jobId = parseInt(req.params.jobId, 10);
+                if (!Number.isFinite(jobId) || jobId < 1) return res.status(400).json(APIResponse.badRequest('Invalid job ID'));
+                const { getRestoreJob } = require('../utils/serverBackup');
+                const job = await getRestoreJob(jobId);
+                if (!job || job.targetGuildId !== guild.id) return res.status(404).json(APIResponse.notFound('Job not found'));
+                res.json(APIResponse.success(job, 'Job status', 'RESTORE_JOB_STATUS'));
+            } catch (error) {
+                res.status(500).json(APIResponse.error(error.message, 'RESTORE_JOB_STATUS_FAILED'));
+            }
+        });
+
+        this.app.get('/guilds/:guildId/restore-jobs/latest', async (req, res) => {
+            try {
+                const guild = this.client.guilds.cache.get(req.params.guildId);
+                if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+                const { getLatestRunningRestoreJob } = require('../utils/serverBackup');
+                const job = await getLatestRunningRestoreJob(guild.id);
+                if (!job) return res.status(404).json(APIResponse.notFound('No running job'));
+                res.json(APIResponse.success(job, 'Latest running restore job', 'RESTORE_JOB_LATEST'));
+            } catch (error) {
+                res.status(500).json(APIResponse.error(error.message, 'RESTORE_JOB_LATEST_FAILED'));
+            }
+        });
+
         // --- Moderation: Fall-Historie ---
         this.app.get('/guilds/:guildId/moderation/cases', async (req, res) => {
             const guild = this.client.guilds.cache.get(req.params.guildId);

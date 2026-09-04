@@ -351,6 +351,30 @@ const commands = [
                 .setName("unclaim")
                 .setDescription("Release this ticket back to the team")
         ),
+    new SlashCommandBuilder()
+        .setName("serverbackup")
+        .setDescription("💾 Backup and view your server structure (roles, channels, emojis, settings)")
+        .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator)
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName("create")
+                .setDescription("Create a full server backup (roles, channels, emojis, settings)")
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName("list")
+                .setDescription("List existing server backups")
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName("info")
+                .setDescription("Show details of a specific backup")
+                .addStringOption(option =>
+                    option.setName("filename")
+                        .setDescription("Backup ID (from /serverbackup list)")
+                        .setRequired(true)
+                )
+        ),
 ];
 
 // 1:1 aus fahrstuhl/commands/index.js (mod-Block) uebernommen -- Verhalten bewusst identisch,
@@ -991,6 +1015,90 @@ async function handleTicketCommand(interaction) {
     }
 }
 
+// 1:1 aus fahrstuhl/commands/index.js (serverbackup-Block) uebernommen.
+async function handleServerBackupCommand(interaction) {
+    const member = interaction.member;
+    const isAdmin = member?.permissions?.has(PermissionsBitField.Flags.Administrator);
+    if (!isAdmin && interaction.user.id !== process.env.OWNER_ID) {
+        return safeReply(interaction, {
+            content: "❌ Du brauchst Administrator-Rechte für diesen Command.",
+            flags: [MessageFlags.Ephemeral],
+        });
+    }
+
+    const sub = interaction.options.getSubcommand();
+    const { createBackupJob, createServerBackup, listGuildBackups, getBackupById } = require("../utils/serverBackup");
+
+    if (sub === "create") {
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+
+        const botConfig = getGuildConfig(interaction.guild.id);
+        const jobId = await createBackupJob(interaction.guild.id);
+        createServerBackup(interaction.guild, botConfig, interaction.user.id, jobId).catch(err => {
+            console.error('[serverbackup] create error:', err);
+        });
+
+        const embed = new EmbedBuilder()
+            .setColor(0x5865F2)
+            .setTitle("💾 Server Backup gestartet")
+            .setDescription("Das Backup läuft jetzt im Hintergrund.")
+            .addFields(
+                { name: "Job ID", value: `\`#${jobId}\``, inline: false },
+                { name: "Status", value: "Im Dashboard unter Server-Backup live verfolgen.", inline: false },
+            )
+            .setFooter({ text: "EselModerator Server Backup • Async Queue" })
+            .setTimestamp();
+
+        return interaction.editReply({ embeds: [embed] });
+    }
+
+    if (sub === "list") {
+        const backups = await listGuildBackups(interaction.guild.id);
+        if (!backups.length) {
+            return safeReply(interaction, { content: "📂 Keine Backups gefunden. Nutze `/serverbackup create`.", flags: [MessageFlags.Ephemeral] });
+        }
+        const list = backups.slice(0, 10).map((b) => {
+            const when = `<t:${Math.floor(b.createdAt / 1000)}:f>`;
+            const msgs = b.stats?.messages ?? '?';
+            return `**#${b.id}** · ${when}\n   Rollen: ${b.stats?.roles ?? '?'} · Channels: ${b.stats?.channels ?? '?'} · Nachrichten: ${msgs}`;
+        }).join('\n\n');
+        const embed = new EmbedBuilder()
+            .setColor(0x5865F2)
+            .setTitle(`💾 Server Backups – ${interaction.guild.name}`)
+            .setDescription(list)
+            .setFooter({ text: `${backups.length} Backup(s) · /serverbackup info <id>` });
+        return safeReply(interaction, { embeds: [embed], flags: [MessageFlags.Ephemeral] });
+    }
+
+    if (sub === "info") {
+        const filename = interaction.options.getString("filename");
+        const backupId = parseInt(filename, 10);
+        if (!Number.isFinite(backupId) || backupId < 1) {
+            return safeReply(interaction, { content: "❌ Bitte gib eine gültige Backup-ID an (Zahl aus `/serverbackup list`).", flags: [MessageFlags.Ephemeral] });
+        }
+        const data = await getBackupById(backupId, interaction.guild.id);
+        if (!data) {
+            return safeReply(interaction, { content: "❌ Backup nicht gefunden.", flags: [MessageFlags.Ephemeral] });
+        }
+        const meta = data.meta;
+        const embed = new EmbedBuilder()
+            .setColor(0x5865F2)
+            .setTitle(`💾 Backup #${meta.id}`)
+            .addFields(
+                { name: "Erstellt", value: `<t:${Math.floor(meta.createdAt / 1000)}:f>`, inline: true },
+                { name: "Modus", value: String(meta.backupMode || meta.backup_mode || 'full'), inline: true },
+                { name: "Rollen", value: String(meta.stats?.roles ?? '?'), inline: true },
+                { name: "Channels", value: String(meta.stats?.channels ?? '?'), inline: true },
+                { name: "Emojis", value: String(meta.stats?.emojis ?? '?'), inline: true },
+                { name: "Sticker", value: String(meta.stats?.stickers ?? '?'), inline: true },
+                { name: "Bans", value: String(meta.stats?.bans ?? '?'), inline: true },
+                { name: "Nachrichten", value: String(meta.stats?.messages ?? '?'), inline: true },
+            )
+            .setFooter({ text: `Backup ID #${meta.id}` });
+        return safeReply(interaction, { embeds: [embed], flags: [MessageFlags.Ephemeral] });
+    }
+}
+
 async function handleInteraction(interaction) {
     try {
         if (interaction.isChatInputCommand()) {
@@ -1011,6 +1119,9 @@ async function handleInteraction(interaction) {
             }
             if (interaction.commandName === "ticket") {
                 return handleTicketCommand(interaction);
+            }
+            if (interaction.commandName === "serverbackup") {
+                return handleServerBackupCommand(interaction);
             }
             return;
         }

@@ -103,6 +103,19 @@ client.once(Events.ClientReady, async () => {
     activeIntervals.push(setInterval(updatePresence, 10 * 60 * 1000));
     socialNotifier.start(client);
     freeGamesNotifier.start(client);
+
+    const scheduledDiscordBackups = setInterval(async () => {
+        try {
+            const { processScheduledBackups } = require("./utils/serverBackup");
+            const result = await processScheduledBackups(client, getGuildConfig, console);
+            if (result?.processed > 0) {
+                console.log(`🗂️ Scheduled discord backups checked: processed=${result.processed}, started=${result.started}, failed=${result.failed}`);
+            }
+        } catch (err) {
+            console.error("❌ Scheduled discord backup runner failed:", err.message);
+        }
+    }, 60000); // every minute
+    activeIntervals.push(scheduledDiscordBackups);
 });
 
 client.on(Events.InteractionCreate, (interaction) => {

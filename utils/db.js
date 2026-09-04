@@ -131,6 +131,86 @@ async function initDb({ host, port, user, password, database }) {
         )
     `);
 
+    // Server-Backup/Restore (Struktur-Snapshots: Kanaele/Rollen/Berechtigungen) -- Schema
+    // 1:1 aus fahrstuhl/utils/db.js uebernommen.
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS discord_backups (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            guild_id VARCHAR(32) NOT NULL,
+            name VARCHAR(255) NOT NULL,
+            created_by VARCHAR(32) DEFAULT NULL,
+            created_at BIGINT NOT NULL,
+            stats JSON,
+            backup_mode VARCHAR(16) NOT NULL DEFAULT 'full',
+            parent_backup_id BIGINT DEFAULT NULL,
+            INDEX idx_backup_guild (guild_id),
+            INDEX idx_backup_guild_time (guild_id, created_at)
+        )
+    `);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS discord_backup_sections (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            backup_id BIGINT NOT NULL,
+            section VARCHAR(64) NOT NULL,
+            data LONGTEXT NOT NULL,
+            data_hash VARCHAR(64) DEFAULT NULL,
+            INDEX idx_section_backup (backup_id),
+            INDEX idx_section_lookup (backup_id, section)
+        )
+    `);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS discord_restore_jobs (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            backup_id BIGINT NOT NULL,
+            target_guild_id VARCHAR(32) NOT NULL,
+            status ENUM('running','done','failed') DEFAULT 'running',
+            phase VARCHAR(128) DEFAULT NULL,
+            progress_current INT DEFAULT 0,
+            progress_total INT DEFAULT 0,
+            log TEXT,
+            result JSON,
+            started_at BIGINT NOT NULL,
+            finished_at BIGINT DEFAULT NULL,
+            INDEX idx_restore_guild (target_guild_id),
+            INDEX idx_restore_backup (backup_id)
+        )
+    `);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS discord_backup_jobs (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            guild_id VARCHAR(32) NOT NULL,
+            status ENUM('running','done','failed') DEFAULT 'running',
+            phase VARCHAR(128) DEFAULT NULL,
+            progress_current INT DEFAULT 0,
+            progress_total INT DEFAULT 0,
+            log TEXT,
+            result JSON,
+            started_at BIGINT NOT NULL,
+            finished_at BIGINT DEFAULT NULL,
+            INDEX idx_backup_jobs_guild (guild_id),
+            INDEX idx_backup_jobs_status (status)
+        )
+    `);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS discord_backup_schedules (
+            guild_id VARCHAR(32) PRIMARY KEY,
+            enabled TINYINT(1) NOT NULL DEFAULT 0,
+            interval_hours INT NOT NULL DEFAULT 24,
+            retention_count INT NOT NULL DEFAULT 10,
+            backup_mode VARCHAR(16) NOT NULL DEFAULT 'full',
+            next_run_at BIGINT DEFAULT NULL,
+            last_run_at BIGINT DEFAULT NULL,
+            last_job_id BIGINT DEFAULT NULL,
+            created_by VARCHAR(32) DEFAULT NULL,
+            updated_at BIGINT NOT NULL,
+            INDEX idx_backup_schedules_enabled_next (enabled, next_run_at)
+        )
+    `);
+
     return pool;
 }
 
