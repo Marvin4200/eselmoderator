@@ -52,6 +52,17 @@ async function initDb({ host, port, user, password, database }) {
         )
     `);
 
+    // Temp-Voice-Kanaele (Temp-Voice-Modul) -- Schema 1:1 aus fahrstuhl/utils/db.js.
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS temp_voice_channels (
+            channel_id VARCHAR(32) PRIMARY KEY,
+            guild_id VARCHAR(32) NOT NULL,
+            owner_id VARCHAR(32) NOT NULL,
+            created_at BIGINT NOT NULL,
+            INDEX idx_temp_voice_guild (guild_id)
+        )
+    `);
+
     // Server-Event-Logs (Logging-Modul) -- Schema 1:1 aus fahrstuhl/utils/db.js.
     await pool.query(`
         CREATE TABLE IF NOT EXISTS server_log_events (

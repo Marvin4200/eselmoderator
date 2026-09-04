@@ -16,6 +16,7 @@ const { parseBoolean } = require("../utils/valueParsers");
 const { sendServerLog } = require("../utils/serverLogger");
 const { getPool } = require("../utils/db");
 const { handleReactionRoleButton, handleReactionRoleSelect } = require("../utils/reactionRoles");
+const { tempVoiceChannels } = require("../utils/tempVoice");
 
 function moduleEnabled(config, key, fallback = false) {
     const modules = config.modules || {};
@@ -170,6 +171,57 @@ const commands = [
                         .setRequired(false)
                         .setMaxLength(250)
                 )
+        ),
+    new SlashCommandBuilder()
+        .setName("voice")
+        .setDescription("🔊 Manage your temporary voice channel")
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName("rename")
+                .setDescription("Rename your temp voice channel")
+                .addStringOption(option =>
+                    option.setName("name")
+                        .setDescription("New channel name (max 90 chars)")
+                        .setRequired(true)
+                        .setMaxLength(90)
+                )
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName("lock")
+                .setDescription("Lock your temp voice channel (nobody can join)")
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName("unlock")
+                .setDescription("Unlock your temp voice channel (everyone can join again)")
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName("limit")
+                .setDescription("Set a user limit for your temp voice channel")
+                .addIntegerOption(option =>
+                    option.setName("slots")
+                        .setDescription("Max users (0 = no limit)")
+                        .setRequired(true)
+                        .setMinValue(0)
+                        .setMaxValue(99)
+                )
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName("kick")
+                .setDescription("Kick a user from your temp voice channel")
+                .addUserOption(option =>
+                    option.setName("user")
+                        .setDescription("The user to kick from the channel")
+                        .setRequired(true)
+                )
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName("claim")
+                .setDescription("Claim ownership of a temp voice channel (if owner left)")
         ),
 ];
 
@@ -583,11 +635,102 @@ async function handleModCommand(interaction) {
     }
 }
 
+// 1:1 aus fahrstuhl/commands/index.js (voice-Block) uebernommen.
+async function handleVoiceCommand(interaction) {
+    const sub = interaction.options.getSubcommand();
+    const member = interaction.member;
+    const voiceChannel = member?.voice?.channel;
+
+    if (!voiceChannel) {
+        return safeReply(interaction, { content: "❌ Du bist in keinem Voice-Channel.", flags: [MessageFlags.Ephemeral] });
+    }
+
+    const tvData = tempVoiceChannels?.get(voiceChannel.id);
+    const isOwner = tvData?.ownerId === interaction.user.id;
+
+    if (sub === "claim") {
+        if (!tvData) {
+            return safeReply(interaction, { content: "❌ Das ist kein Temp Voice Channel.", flags: [MessageFlags.Ephemeral] });
+        }
+        const ownerInChannel = voiceChannel.members.has(tvData.ownerId);
+        if (ownerInChannel) {
+            return safeReply(interaction, { content: "❌ Der Owner ist noch im Channel. Du kannst ihn nicht claimen.", flags: [MessageFlags.Ephemeral] });
+        }
+        tempVoiceChannels.set(voiceChannel.id, { ...tvData, ownerId: interaction.user.id });
+        try {
+            await getPool().query("UPDATE temp_voice_channels SET owner_id = ? WHERE channel_id = ?", [interaction.user.id, voiceChannel.id]);
+        } catch (dbErr) {
+            console.warn(`⚠️ Failed to persist temp voice claim for ${voiceChannel.id}: ${dbErr.message}`);
+        }
+        return safeReply(interaction, { content: `✅ Du bist jetzt Owner von **${voiceChannel.name}**.`, flags: [MessageFlags.Ephemeral] });
+    }
+
+    if (!tvData) {
+        return safeReply(interaction, { content: "❌ Das ist kein Temp Voice Channel.", flags: [MessageFlags.Ephemeral] });
+    }
+    if (!isOwner) {
+        return safeReply(interaction, { content: "❌ Du bist nicht der Owner dieses Channels.", flags: [MessageFlags.Ephemeral] });
+    }
+
+    const config = getGuildConfig(interaction.guildId);
+    const tvSettings = (config.tempVoice && typeof config.tempVoice === "object") ? config.tempVoice : {};
+
+    if (sub === "rename") {
+        if (!parseBoolean(tvSettings.allowRename, true)) {
+            return safeReply(interaction, { content: "❌ Rename ist auf diesem Server deaktiviert.", flags: [MessageFlags.Ephemeral] });
+        }
+        const newName = interaction.options.getString("name").replace(/[\\/#]/g, " ").trim().slice(0, 90);
+        if (!newName) return safeReply(interaction, { content: "❌ Ungültiger Name.", flags: [MessageFlags.Ephemeral] });
+        await voiceChannel.setName(newName, "EselModerator temp voice rename").catch(() => null);
+        return safeReply(interaction, { content: `✅ Channel umbenannt zu **${newName}**.`, flags: [MessageFlags.Ephemeral] });
+    }
+
+    if (sub === "lock") {
+        if (!parseBoolean(tvSettings.allowLock, true)) {
+            return safeReply(interaction, { content: "❌ Lock ist auf diesem Server deaktiviert.", flags: [MessageFlags.Ephemeral] });
+        }
+        await voiceChannel.permissionOverwrites.edit(interaction.guild.roles.everyone, { Connect: false }, { reason: "EselModerator temp voice lock" }).catch(() => null);
+        return safeReply(interaction, { content: `🔒 **${voiceChannel.name}** ist jetzt gesperrt.`, flags: [MessageFlags.Ephemeral] });
+    }
+
+    if (sub === "unlock") {
+        if (!parseBoolean(tvSettings.allowLock, true)) {
+            return safeReply(interaction, { content: "❌ Lock ist auf diesem Server deaktiviert.", flags: [MessageFlags.Ephemeral] });
+        }
+        await voiceChannel.permissionOverwrites.edit(interaction.guild.roles.everyone, { Connect: null }, { reason: "EselModerator temp voice unlock" }).catch(() => null);
+        return safeReply(interaction, { content: `🔓 **${voiceChannel.name}** ist jetzt offen.`, flags: [MessageFlags.Ephemeral] });
+    }
+
+    if (sub === "limit") {
+        if (!parseBoolean(tvSettings.allowLimit, true)) {
+            return safeReply(interaction, { content: "❌ Limit ist auf diesem Server deaktiviert.", flags: [MessageFlags.Ephemeral] });
+        }
+        const slots = interaction.options.getInteger("slots");
+        await voiceChannel.setUserLimit(slots, "EselModerator temp voice limit").catch(() => null);
+        return safeReply(interaction, {
+            content: slots === 0 ? `✅ User-Limit für **${voiceChannel.name}** entfernt.` : `✅ User-Limit auf **${slots}** gesetzt.`,
+            flags: [MessageFlags.Ephemeral],
+        });
+    }
+
+    if (sub === "kick") {
+        const target = interaction.options.getMember("user");
+        if (!target) return safeReply(interaction, { content: "❌ User nicht gefunden.", flags: [MessageFlags.Ephemeral] });
+        if (target.id === interaction.user.id) return safeReply(interaction, { content: "❌ Du kannst dich nicht selbst kicken.", flags: [MessageFlags.Ephemeral] });
+        if (!voiceChannel.members.has(target.id)) return safeReply(interaction, { content: "❌ Der User ist nicht in deinem Channel.", flags: [MessageFlags.Ephemeral] });
+        await target.voice.disconnect("EselModerator temp voice kick").catch(() => null);
+        return safeReply(interaction, { content: `✅ **${target.user.username}** wurde aus dem Channel geworfen.`, flags: [MessageFlags.Ephemeral] });
+    }
+}
+
 async function handleInteraction(interaction) {
     try {
         if (interaction.isChatInputCommand()) {
             if (interaction.commandName === "mod") {
                 return handleModCommand(interaction);
+            }
+            if (interaction.commandName === "voice") {
+                return handleVoiceCommand(interaction);
             }
             return;
         }

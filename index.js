@@ -2,7 +2,8 @@
 //
 // Loggt sich bei Discord ein, initialisiert die eigene MySQL-DB und das eigene
 // Premium-System, registriert Slash-Commands und startet den Health-API-Server.
-const { Client, GatewayIntentBits, Events, REST, Routes } = require("discord.js");
+const { Client, GatewayIntentBits, Events, REST, Routes, ActivityType } = require("discord.js");
+const { version: BOT_VERSION } = require("./package.json");
 require("dotenv").config();
 
 const { initConfig, getGuildConfig } = require("./utils/config");
@@ -17,6 +18,7 @@ const {
     applyAutoModRuleAction,
 } = require("./utils/automod");
 const { sendConfiguredWelcome } = require("./utils/welcome");
+const { restoreTempVoiceChannels, handleTempVoiceUpdate } = require("./utils/tempVoice");
 const premiumManager = require("./utils/premiumManager");
 const BotAPIServer = require("./services/botAPI");
 const { commands, handleInteraction } = require("./commands/index");
@@ -40,6 +42,7 @@ const client = new Client({
         GatewayIntentBits.GuildMembers,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildVoiceStates,
     ],
 });
 
@@ -63,10 +66,30 @@ async function syncSlashCommands() {
     }
 }
 
+// Rotierender Status, der zeigt was der Bot tatsaechlich macht -- Muster aus
+// fahrstuhl/index.js's updatePresence uebernommen, Inhalte auf EselModerators
+// Moderation/Tickets/Leveling-Fokus zugeschnitten statt Troll-Themen.
+function updatePresence() {
+    try {
+        const statuses = [
+            { name: `${client.guilds.cache.size} Server`, type: ActivityType.Watching },
+            { name: "/mod · Moderation", type: ActivityType.Playing },
+            { name: "über Tickets", type: ActivityType.Watching },
+            { name: `v${BOT_VERSION}`, type: ActivityType.Playing },
+        ];
+        const randomStatus = statuses[Math.floor(Math.random() * statuses.length)];
+        client.user.setPresence({ activities: [randomStatus], status: "online" });
+    } catch (err) {
+        console.error("❌ Error updating presence:", err);
+    }
+}
+
 client.once(Events.ClientReady, async () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
     console.log(`✓ ${client.guilds.cache.size} Guild(s) verbunden`);
     await syncSlashCommands();
+    updatePresence();
+    activeIntervals.push(setInterval(updatePresence, 10 * 60 * 1000));
 });
 
 client.on(Events.InteractionCreate, (interaction) => {
@@ -197,6 +220,13 @@ client.on(Events.GuildMemberRemove, async (member) => {
     }).catch(() => {});
 });
 
+// Temp-Voice -- 1:1 aus fahrstuhl/index.js's voiceStateUpdate-Handler uebernommen.
+client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+    handleTempVoiceUpdate(oldState, newState, getGuildConfig).catch((err) => {
+        console.error("Temp voice handler error:", err);
+    });
+});
+
 // Alte Strike-Eintraege regelmaessig aufraeumen (24h-Fenster), damit die Map nicht unbegrenzt waechst.
 const autoModCleanup = setInterval(() => {
     const since = Date.now() - 24 * 60 * 60 * 1000;
@@ -220,6 +250,8 @@ async function main() {
 
     await initConfig();
     console.log("✓ MySQL-Datenbank initialisiert");
+
+    await restoreTempVoiceChannels();
 
     await premiumManager.initialize();
 
