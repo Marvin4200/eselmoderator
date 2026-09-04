@@ -32,6 +32,40 @@ async function initDb({ host, port, user, password, database }) {
         )
     `);
 
+    // Moderation (Warn/Timeout/Kick/Ban/Unban-Faelle) -- Schema 1:1 aus fahrstuhl/utils/db.js.
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS moderation_cases (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            guild_id VARCHAR(32) NOT NULL,
+            user_id VARCHAR(32) NOT NULL,
+            moderator_id VARCHAR(32) DEFAULT NULL,
+            type VARCHAR(32) NOT NULL,
+            reason TEXT,
+            duration_ms BIGINT DEFAULT NULL,
+            expires_at BIGINT DEFAULT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'active',
+            created_at BIGINT NOT NULL,
+            updated_at BIGINT NOT NULL,
+            INDEX idx_mod_guild_time (guild_id, created_at),
+            INDEX idx_mod_user_time (guild_id, user_id, created_at),
+            INDEX idx_mod_status (guild_id, status)
+        )
+    `);
+
+    // Server-Event-Logs (Logging-Modul) -- Schema 1:1 aus fahrstuhl/utils/db.js.
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS server_log_events (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            guild_id VARCHAR(32) NOT NULL,
+            event_key VARCHAR(64) NOT NULL,
+            title VARCHAR(256),
+            description TEXT,
+            color INT DEFAULT NULL,
+            created_at BIGINT NOT NULL,
+            INDEX idx_sle_guild_time (guild_id, created_at)
+        )
+    `);
+
     return pool;
 }
 
