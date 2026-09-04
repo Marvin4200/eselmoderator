@@ -21,6 +21,7 @@ const {
     resolveTicketPanelDesign,
 } = require('../utils/ticketPanel');
 const ticketStore = require('../utils/ticketStore');
+const premiumManager = require('../utils/premiumManager');
 
 function discordImageUrl(value) {
     const url = String(value || '').trim();
@@ -314,11 +315,14 @@ class BotAPIServer {
 
                 // Ein Server kann mehrere Panels haben (eins pro Kanal); erneutes Senden in
                 // einen Kanal mit bereits aktivem Panel aktualisiert dieses statt ein neues
-                // zu zaehlen. Kein Limit-Check hier (anders als bei fahrstuhl) -- kommt mit
-                // den echten Premium-Tier-Definitionen in einer spaeteren Runde.
+                // zu zaehlen.
                 const existingPanels = normalizeTicketPanels(config.tickets);
                 const existingPanelIndex = existingPanels.findIndex(p => p.channelId === channel.id);
                 const isNewPanelDeployment = existingPanelIndex === -1;
+                const limits = await premiumManager.getGuildFeatureLimits(guild.id, guild.ownerId);
+                if (limits.ticketPanels >= 0 && isNewPanelDeployment && existingPanels.length >= limits.ticketPanels) {
+                    return res.status(403).json({ success: false, error: 'Feature limit reached', code: 'LIMIT_REACHED', limitKey: 'ticketPanels', limit: limits.ticketPanels, current: existingPanels.length, upgrade: true });
+                }
 
                 let message = null;
                 if (!isNewPanelDeployment) {
@@ -364,6 +368,77 @@ class BotAPIServer {
                 res.json(APIResponse.success({ guildId: guild.id, channelId, remaining: remainingPanels.length }, 'Ticket panel removed', 'TICKET_PANEL_REMOVED'));
             } catch (error) {
                 res.status(500).json(APIResponse.error(error.message, 'TICKET_PANEL_REMOVE_FAILED'));
+            }
+        });
+
+        // 1:1 aus fahrstuhl/services/botAPI.js uebernommen -- der Endpunkt, den
+        // shop.eselbande.com fuer EselModerator-Produkte aufrufen wird (Phase 5).
+        this.app.post('/premium/activate', async (req, res) => {
+            try {
+                const { userId, daysValid = 30, tier = 'basic' } = req.body;
+                if (!userId) return res.status(400).json({ error: 'userId required' });
+                if (!['basic', 'pro'].includes(tier)) return res.status(400).json({ error: 'tier must be basic or pro' });
+                const days = Math.max(1, Math.min(36500, Number(daysValid) || 30));
+                const mode = req.body.mode === 'set' ? 'set' : 'extend';
+
+                await premiumManager.activatePremium(userId, days, tier, mode);
+                const info = await premiumManager.getUserInfo(userId);
+
+                try {
+                    const user = await this.client.users.fetch(userId).catch(() => null);
+                    if (user) {
+                        const expiresAt = new Date(info.expires_at);
+                        const tierLabel = tier === 'pro' ? '👑 Pro' : '💎 Premium';
+                        const embed = new EmbedBuilder()
+                            .setColor(tier === 'pro' ? 0xFFD700 : 0x4CAF50)
+                            .setTitle(`✅ ${tierLabel} Activated`)
+                            .setDescription(`You now have **${tierLabel}** access on EselModerator!`)
+                            .addFields(
+                                { name: 'Tier', value: tierLabel },
+                                { name: 'Days', value: String(days) },
+                                { name: 'Expires', value: expiresAt.toLocaleString() }
+                            )
+                            .setTimestamp();
+                        user.send({ embeds: [embed] }).catch(() => {});
+                    }
+                } catch (dmError) {
+                    console.error('Error sending premium activation DM:', dmError.message);
+                }
+
+                res.json(APIResponse.success({
+                    userId, tier: info.tier, isPremium: info.is_premium, expiresAt: info.expires_at,
+                }, `${tier} activated for ${days} days`, 'PREMIUM_ACTIVATED'));
+            } catch (error) {
+                console.error('Premium activation error:', error);
+                res.status(500).json(APIResponse.error(error.message, 'PREMIUM_ACTIVATION_FAILED'));
+            }
+        });
+
+        this.app.post('/premium/deactivate', async (req, res) => {
+            try {
+                const { userId } = req.body;
+                if (!userId) return res.status(400).json(APIResponse.badRequest('userId required'));
+
+                await premiumManager.deactivatePremium(userId);
+
+                try {
+                    const user = await this.client.users.fetch(userId).catch(() => null);
+                    if (user) {
+                        const embed = new EmbedBuilder()
+                            .setColor(0xff6b6b)
+                            .setTitle('❌ Premium Removed')
+                            .setDescription('Your EselModerator Premium access has been removed.')
+                            .setTimestamp();
+                        user.send({ embeds: [embed] }).catch(() => {});
+                    }
+                } catch (dmError) {
+                    console.error('Error sending premium deactivation DM:', dmError.message);
+                }
+
+                res.json(APIResponse.success({ userId }, 'Premium deactivated', 'PREMIUM_DEACTIVATED'));
+            } catch (error) {
+                console.error('Premium deactivation error:', error);
+                res.status(500).json(APIResponse.error(error.message, 'PREMIUM_DEACTIVATION_FAILED'));
             }
         });
     }

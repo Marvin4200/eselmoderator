@@ -8,6 +8,14 @@
 
 const PremiumDatabase = require('./premiumDatabase');
 
+// EselModerators eigene Tier-Limits -- gleiche Struktur wie fahrstuhls FEATURE_LIMITS
+// (services/botAPI.js), aber unabhaengige Werte fuer EselModerators eigene Features.
+const FEATURE_LIMITS = {
+    free: { planName: 'Free', ticketPanels: 1, reactionRolePanels: 3, automodRules: 5, logGroups: 3, welcomeMessages: 1 },
+    basic: { planName: 'Premium', ticketPanels: 3, reactionRolePanels: 10, automodRules: 20, logGroups: 10, welcomeMessages: 3 },
+    pro: { planName: 'Pro', ticketPanels: -1, reactionRolePanels: -1, automodRules: -1, logGroups: -1, welcomeMessages: -1 },
+};
+
 class PremiumManager {
     constructor() {
         this.db = PremiumDatabase;
@@ -82,6 +90,12 @@ class PremiumManager {
 
     async activateGuildPlan(guildId, daysValid = 30, tier = 'basic', purchasedBy = null, mode = 'extend') {
         return await this.db.activateGuild(guildId, daysValid, tier, purchasedBy, mode);
+    }
+
+    /** Feature-Limits fuer eine Guild -- eigener Guild-Plan, sonst des Owners Premium, sonst Free. */
+    async getGuildFeatureLimits(guildId, ownerId = null) {
+        const { tier } = await this.getGuildTier(guildId, ownerId);
+        return FEATURE_LIMITS[tier] || FEATURE_LIMITS.free;
     }
 
     async deactivateGuildPlan(guildId) {
