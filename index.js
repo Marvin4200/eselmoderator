@@ -2,7 +2,7 @@
 //
 // Loggt sich bei Discord ein, initialisiert die eigene MySQL-DB und das eigene
 // Premium-System, registriert Slash-Commands und startet den Health-API-Server.
-const { Client, GatewayIntentBits, Events, REST, Routes, ActivityType } = require("discord.js");
+const { Client, GatewayIntentBits, Events, REST, Routes, ActivityType, EmbedBuilder, PermissionsBitField } = require("discord.js");
 const { version: BOT_VERSION } = require("./package.json");
 require("dotenv").config();
 
@@ -19,6 +19,14 @@ const {
 } = require("./utils/automod");
 const { sendConfiguredWelcome } = require("./utils/welcome");
 const { restoreTempVoiceChannels, handleTempVoiceUpdate } = require("./utils/tempVoice");
+const levelingManager = require("./utils/levelingManager");
+const {
+    resolvePremiumXpMultiplier,
+    cleanupPremiumXpCache,
+    renderLevelTemplate,
+    syncLevelRoles,
+    syncLevelRolesForMember,
+} = require("./utils/leveling");
 const premiumManager = require("./utils/premiumManager");
 const BotAPIServer = require("./services/botAPI");
 const { commands, handleInteraction } = require("./commands/index");
@@ -183,6 +191,78 @@ client.on(Events.MessageCreate, async (message) => {
     }
 });
 
+// Leveling (Nachrichten-XP) -- 1:1 aus fahrstuhl/index.js's messageCreate-Handler uebernommen.
+// Laeuft als eigener Listener statt im AutoMod-Handler weiter, damit ein AutoMod-Fruehausstieg
+// (return bei Regelverstoss) nicht versehentlich auch Leveling fuer diese Nachricht blockiert --
+// im Original teilen sich beide denselben Handler und AutoMod endet dort explizit mit return.
+client.on(Events.MessageCreate, async (message) => {
+    try {
+        if (!message.guild || message.author?.bot) return;
+        const config = getGuildConfig(message.guild.id);
+        if (!moduleEnabled(config, "leveling", false)) return;
+
+        const levelSettings = levelingManager.getLevelSettings(config);
+        const isAdmin = message.member?.permissions.has(PermissionsBitField.Flags.Administrator);
+        if (levelSettings.noXpChannels.includes(message.channel.id)) return;
+        if (!isAdmin && message.member?.roles.cache.some(r => levelSettings.ignoredRoles.includes(r.id))) return;
+
+        const msgPremiumMultiplier = await resolvePremiumXpMultiplier(message.author.id);
+        const result = await levelingManager.addMessageXp({
+            guildId: message.guild.id,
+            userId: message.author.id,
+            channelId: message.channel.id,
+            roleIds: message.member?.roles?.cache ? Array.from(message.member.roles.cache.keys()) : [],
+            config,
+            content: message.content,
+            premiumMultiplier: msgPremiumMultiplier,
+        });
+        if (result?.skipped) return;
+
+        if (result.leveledUp && result.announceLevelUp) {
+            await syncLevelRoles(message, result, config);
+            const settings = levelingManager.getLevelSettings(config);
+            const announceChannel = settings.announceChannelId
+                ? message.guild.channels.cache.get(settings.announceChannelId)
+                : message.channel;
+            const targetChannel = announceChannel?.isTextBased?.() ? announceChannel : message.channel;
+            const earnedReward = Array.isArray(settings.roleRewards)
+                ? settings.roleRewards.find(r => r.level === result.level)
+                : null;
+            const levelEmbed = new EmbedBuilder()
+                .setColor(0x51cf66)
+                .setTitle("🎉 Level Up!")
+                .setDescription(renderLevelTemplate(settings.announceMessage, message, result))
+                .addFields(
+                    { name: "Level", value: `**${result.level}**`, inline: true },
+                    { name: "Total XP", value: `**${result.xp.toLocaleString()}**`, inline: true },
+                )
+                .setThumbnail(message.author.displayAvatarURL({ size: 64 }))
+                .setTimestamp();
+            if (earnedReward) {
+                const earnedRole = message.guild.roles.cache.get(earnedReward.roleId);
+                if (earnedRole) levelEmbed.addFields({ name: "🏆 New Role", value: `<@&${earnedRole.id}>`, inline: true });
+            }
+            await targetChannel.send({ embeds: [levelEmbed], allowedMentions: { users: [message.author.id] } }).catch(() => {});
+        } else if (result.leveledUp) {
+            await syncLevelRoles(message, result, config);
+        }
+
+        if (result.leveledUp) {
+            sendServerLog(message.guild, config, "leveling", {
+                title: "Level Up",
+                description: `${message.author} reached level **${result.level}**.`,
+                color: 0x51cf66,
+                fields: [
+                    { name: "User", value: `${message.author.username}\n\`${message.author.id}\``, inline: true },
+                    { name: "Level", value: String(result.level), inline: true },
+                ],
+            }).catch(() => {});
+        }
+    } catch (err) {
+        console.error("Leveling handler error:", err);
+    }
+});
+
 // Welcome/Goodbye -- 1:1 aus fahrstuhl/index.js's guildMemberAdd/guildMemberRemove uebernommen
 // (ohne die Live-Dashboard-Events und die Kick-vs-Leave-Audit-Log-Unterscheidung, die als
 // Feinschliff spaeter nachgezogen werden kann).
@@ -226,6 +306,67 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
         console.error("Temp voice handler error:", err);
     });
 });
+
+// Voice-XP -- 1:1 aus fahrstuhl/index.js's voiceXpInterval uebernommen (Zeilen ~1480-1528).
+const voiceXpInterval = setInterval(async () => {
+    for (const [guildId, guild] of client.guilds.cache) {
+        try {
+            const config = getGuildConfig(guildId);
+            if (!moduleEnabled(config, "leveling", false)) continue;
+            const settings = levelingManager.getLevelSettings(config);
+            if (!settings.voiceXpEnabled) continue;
+
+            for (const [, channel] of guild.channels.cache) {
+                if (channel.type !== 2) continue;
+                const eligible = channel.members.filter(m =>
+                    !m.user.bot && !m.voice.selfMute && !m.voice.selfDeaf && !m.voice.serverMute && !m.voice.serverDeaf
+                );
+                if (eligible.size < 2) continue;
+
+                for (const [, member] of eligible) {
+                    const voiceResult = await levelingManager.addVoiceXp({
+                        guildId,
+                        userId: member.id,
+                        config,
+                        premiumMultiplier: await resolvePremiumXpMultiplier(member.id),
+                    }).catch(() => null);
+                    if (!voiceResult || voiceResult.skipped) continue;
+
+                    if (voiceResult.leveledUp) {
+                        await syncLevelRolesForMember(guild, member, voiceResult.level, config).catch(() => {});
+                        if (voiceResult.announceLevelUp) {
+                            const announceChannelId = settings.announceChannelId;
+                            const announceChannel = announceChannelId ? guild.channels.cache.get(announceChannelId) : null;
+                            if (announceChannel?.isTextBased?.()) {
+                                const voiceEmbed = new EmbedBuilder()
+                                    .setColor(0x4dabf7)
+                                    .setTitle("🎙️ Voice Level Up!")
+                                    .setDescription(`${member} reached level **${voiceResult.level}**!`)
+                                    .addFields(
+                                        { name: "Level", value: `**${voiceResult.level}**`, inline: true },
+                                        { name: "Total XP", value: `**${voiceResult.xp.toLocaleString()}**`, inline: true },
+                                    )
+                                    .setThumbnail(member.user.displayAvatarURL({ size: 64 }))
+                                    .setTimestamp();
+                                await announceChannel.send({ embeds: [voiceEmbed], allowedMentions: { users: [member.id] } }).catch(() => {});
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (err) {
+            console.error(`❌ Voice XP interval error in guild ${guildId}:`, err.message);
+        }
+    }
+}, 60_000);
+activeIntervals.push(voiceXpInterval);
+
+// Abgelaufene Cooldown-/Cache-Eintraege regelmaessig aufraeumen (unbegrenztes Map-Wachstum vermeiden).
+const levelingMapsCleanup = setInterval(() => {
+    levelingManager.cleanupStaleEntries();
+    cleanupPremiumXpCache();
+}, 30 * 60 * 1000);
+activeIntervals.push(levelingMapsCleanup);
 
 // Alte Strike-Eintraege regelmaessig aufraeumen (24h-Fenster), damit die Map nicht unbegrenzt waechst.
 const autoModCleanup = setInterval(() => {

@@ -63,6 +63,23 @@ async function initDb({ host, port, user, password, database }) {
         )
     `);
 
+    // Leveling (Leveling-Modul) -- Schema 1:1 aus fahrstuhl/utils/db.js.
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS guild_user_levels (
+            guild_id VARCHAR(32) NOT NULL,
+            user_id VARCHAR(32) NOT NULL,
+            xp BIGINT NOT NULL DEFAULT 0,
+            level INT NOT NULL DEFAULT 0,
+            message_count BIGINT NOT NULL DEFAULT 0,
+            voice_xp BIGINT NOT NULL DEFAULT 0,
+            last_message_xp_at BIGINT NOT NULL DEFAULT 0,
+            updated_at BIGINT NOT NULL,
+            PRIMARY KEY (guild_id, user_id),
+            INDEX idx_level_leaderboard (guild_id, xp),
+            INDEX idx_level_updated (guild_id, updated_at)
+        )
+    `);
+
     // Server-Event-Logs (Logging-Modul) -- Schema 1:1 aus fahrstuhl/utils/db.js.
     await pool.query(`
         CREATE TABLE IF NOT EXISTS server_log_events (

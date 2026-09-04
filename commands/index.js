@@ -17,6 +17,7 @@ const { sendServerLog } = require("../utils/serverLogger");
 const { getPool } = require("../utils/db");
 const { handleReactionRoleButton, handleReactionRoleSelect } = require("../utils/reactionRoles");
 const { tempVoiceChannels } = require("../utils/tempVoice");
+const levelingManager = require("../utils/levelingManager");
 
 function moduleEnabled(config, key, fallback = false) {
     const modules = config.modules || {};
@@ -222,6 +223,43 @@ const commands = [
             subcommand
                 .setName("claim")
                 .setDescription("Claim ownership of a temp voice channel (if owner left)")
+        ),
+    new SlashCommandBuilder()
+        .setName("rank")
+        .setDescription("📈 Show your server level or another user's rank")
+        .addUserOption(option =>
+            option.setName("user")
+                .setDescription("The user")
+                .setRequired(false)
+        ),
+    new SlashCommandBuilder()
+        .setName("leaderboard")
+        .setDescription("🏆 Show this server's leveling leaderboard")
+        .addIntegerOption(option =>
+            option.setName("page")
+                .setDescription("Leaderboard page number")
+                .setRequired(false)
+                .setMinValue(1)
+                .setMaxValue(200)
+        ),
+    new SlashCommandBuilder()
+        .setName("leveling")
+        .setDescription("📈 Manage leveling data for this server")
+        .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild)
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName("resetuser")
+                .setDescription("Reset XP and level for a specific member")
+                .addUserOption(option =>
+                    option.setName("user")
+                        .setDescription("The member to reset")
+                        .setRequired(true)
+                )
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName("resetserver")
+                .setDescription("Reset ALL leveling data for this server (cannot be undone)")
         ),
 ];
 
@@ -723,6 +761,104 @@ async function handleVoiceCommand(interaction) {
     }
 }
 
+// 1:1 aus fahrstuhl/commands/index.js (rank/leaderboard/leveling-Bloecke) uebernommen.
+async function handleRankCommand(interaction) {
+    const config = getGuildConfig(interaction.guildId);
+    if (!parseBoolean(config.modules?.leveling, false)) {
+        return safeReply(interaction, {
+            content: "📈 Leveling is disabled on this server. Enable it in the EselModerator Dashboard under Modules.",
+            flags: [MessageFlags.Ephemeral],
+        });
+    }
+
+    const targetUser = interaction.options.getUser("user") || interaction.user;
+    const settings = levelingManager.getLevelSettings(config);
+    const rank = await levelingManager.getUserLevel(interaction.guildId, targetUser.id);
+    const progress = rank.nextLevelXp > 0 ? Math.round((rank.currentXp / rank.nextLevelXp) * 100) : 0;
+    const cooldownSeconds = Math.max(0, Math.round(settings.cooldownMs / 1000));
+    const embed = new EmbedBuilder()
+        .setColor(0x667eea)
+        .setTitle(`📈 Rank: ${targetUser.username}`)
+        .setThumbnail(targetUser.displayAvatarURL({ size: 128 }))
+        .addFields(
+            { name: "Level", value: `**${rank.level}**`, inline: true },
+            { name: "XP", value: `**${rank.xp}** total`, inline: true },
+            { name: "Rank", value: rank.rank ? `#${rank.rank}` : "Not ranked yet", inline: true },
+            { name: "Progress", value: `${rank.currentXp}/${rank.nextLevelXp} XP (${progress}%)`, inline: false },
+            { name: "Messages", value: String(rank.messageCount || 0), inline: true }
+        )
+        .setFooter({ text: cooldownSeconds > 0 ? `XP counts once every ${cooldownSeconds}s per user.` : "Every message earns XP while Leveling is enabled." });
+    return safeReply(interaction, { embeds: [embed] });
+}
+
+async function handleLeaderboardCommand(interaction) {
+    const config = getGuildConfig(interaction.guildId);
+    if (!parseBoolean(config.modules?.leveling, false)) {
+        return safeReply(interaction, {
+            content: "📈 Leveling is disabled on this server. Enable it in the EselModerator Dashboard under Modules.",
+            flags: [MessageFlags.Ephemeral],
+        });
+    }
+
+    const page = Math.max(1, interaction.options.getInteger("page") || 1);
+    const pageSize = 10;
+    const total = await levelingManager.getLeaderboardTotal(interaction.guildId);
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const safePage = Math.min(page, totalPages);
+    const offset = (safePage - 1) * pageSize;
+    const rows = await levelingManager.getLeaderboard(interaction.guildId, pageSize, offset);
+    const lines = await Promise.all(rows.map(async (row) => {
+        const member = await interaction.guild.members.fetch(row.userId).catch(() => null);
+        const name = member?.displayName || `<@${row.userId}>`;
+        return `**#${row.rank}** ${name} — Level **${row.level}**, ${row.xp} XP`;
+    }));
+    const embed = new EmbedBuilder()
+        .setColor(0x51cf66)
+        .setTitle(`🏆 ${interaction.guild.name} Leaderboard`)
+        .setDescription(lines.length ? lines.join("\n") : "No XP has been tracked yet.")
+        .setFooter({ text: `Page ${safePage}/${totalPages} · ${total} tracked users` });
+    return safeReply(interaction, { embeds: [embed] });
+}
+
+async function handleLevelingAdminCommand(interaction) {
+    const config = getGuildConfig(interaction.guildId);
+    if (!parseBoolean(config.modules?.leveling, false)) {
+        return safeReply(interaction, {
+            content: "📈 Leveling is disabled on this server. Enable it in the EselModerator Dashboard under Modules.",
+            flags: [MessageFlags.Ephemeral],
+        });
+    }
+
+    const hasManageGuild = interaction.memberPermissions?.has(PermissionsBitField.Flags.ManageGuild)
+        || interaction.memberPermissions?.has(PermissionsBitField.Flags.Administrator);
+    if (!hasManageGuild) {
+        return safeReply(interaction, { content: "📈 You need **Manage Server** permission to manage leveling data.", flags: [MessageFlags.Ephemeral] });
+    }
+
+    const subcommand = interaction.options.getSubcommand();
+    if (subcommand === "resetuser") {
+        const targetUser = interaction.options.getUser("user");
+        const affected = await levelingManager.resetUserXp(interaction.guildId, targetUser.id);
+        const embed = new EmbedBuilder()
+            .setColor(0xFEE75C)
+            .setTitle("📈 XP Reset")
+            .setDescription(affected > 0
+                ? `XP and level data for **${targetUser.username}** has been reset.`
+                : `**${targetUser.username}** had no XP data on this server.`)
+            .setTimestamp();
+        return safeReply(interaction, { embeds: [embed], flags: [MessageFlags.Ephemeral] });
+    }
+    if (subcommand === "resetserver") {
+        const affected = await levelingManager.resetGuildXp(interaction.guildId);
+        const embed = new EmbedBuilder()
+            .setColor(0xED4245)
+            .setTitle("📈 Server XP Reset")
+            .setDescription(`All leveling data for **${interaction.guild.name}** has been wiped.\n${affected} records deleted.`)
+            .setTimestamp();
+        return safeReply(interaction, { embeds: [embed], flags: [MessageFlags.Ephemeral] });
+    }
+}
+
 async function handleInteraction(interaction) {
     try {
         if (interaction.isChatInputCommand()) {
@@ -731,6 +867,15 @@ async function handleInteraction(interaction) {
             }
             if (interaction.commandName === "voice") {
                 return handleVoiceCommand(interaction);
+            }
+            if (interaction.commandName === "rank") {
+                return handleRankCommand(interaction);
+            }
+            if (interaction.commandName === "leaderboard") {
+                return handleLeaderboardCommand(interaction);
+            }
+            if (interaction.commandName === "leveling") {
+                return handleLevelingAdminCommand(interaction);
             }
             return;
         }
