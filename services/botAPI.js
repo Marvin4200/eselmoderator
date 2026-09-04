@@ -22,6 +22,11 @@ const {
 } = require('../utils/ticketPanel');
 const ticketStore = require('../utils/ticketStore');
 const premiumManager = require('../utils/premiumManager');
+const { normalizeAutoModSettings } = require('../utils/automod');
+const levelingManager = require('../utils/levelingManager');
+const { parseBoolean } = require('../utils/valueParsers');
+
+const MODULE_KEYS = ['moderation', 'automod', 'welcome', 'reactionRoles', 'leveling', 'tempVoice', 'tickets'];
 
 function discordImageUrl(value) {
     const url = String(value || '').trim();
@@ -116,6 +121,259 @@ class BotAPIServer {
                     pingMs: this.client.ws?.ping ?? null,
                 },
             }, 'Bot is healthy', 'HEALTH_OK'));
+        });
+
+        // --- Generische Endpunkte, die (fast) jede Dashboard-Seite braucht ---
+
+        this.app.get('/guilds', (req, res) => {
+            const guilds = [...this.client.guilds.cache.values()].map(g => ({
+                id: g.id,
+                name: g.name,
+                icon: g.iconURL({ size: 64 }) || null,
+                memberCount: g.memberCount,
+            }));
+            res.json(APIResponse.success({ guilds }, 'Guilds fetched', 'GUILDS_OK'));
+        });
+
+        this.app.get('/guilds/:guildId/context', async (req, res) => {
+            const guild = this.client.guilds.cache.get(req.params.guildId);
+            if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+
+            const categories = guild.channels.cache
+                .filter(c => c.type === 4)
+                .map(c => ({ id: c.id, name: c.name, position: c.position }))
+                .sort((a, b) => a.position - b.position);
+            const channels = guild.channels.cache
+                .filter(c => c.type === 0 && !c.isThread?.())
+                .map(c => ({ id: c.id, name: c.name, position: c.position, parentId: c.parentId }))
+                .sort((a, b) => a.position - b.position);
+            const roles = guild.roles.cache
+                .filter(r => r.name !== '@everyone')
+                .map(r => ({ id: r.id, name: r.name, color: r.hexColor, position: r.position, managed: r.managed }))
+                .sort((a, b) => b.position - a.position);
+
+            res.json(APIResponse.success({
+                guildId: guild.id,
+                guildName: guild.name,
+                categories,
+                channels,
+                roles,
+            }, 'Guild context fetched', 'GUILD_CONTEXT_OK'));
+        });
+
+        this.app.get('/guilds/:guildId/modules', (req, res) => {
+            const guild = this.client.guilds.cache.get(req.params.guildId);
+            if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+            const config = getGuildConfig(guild.id);
+            const modules = config.modules && typeof config.modules === 'object' ? config.modules : {};
+            const result = {};
+            for (const key of MODULE_KEYS) result[key] = parseBoolean(modules[key], false);
+            res.json(APIResponse.success({ guildId: guild.id, modules: result }, 'Modules fetched', 'MODULES_OK'));
+        });
+
+        this.app.post('/guilds/:guildId/modules', (req, res) => {
+            const guild = this.client.guilds.cache.get(req.params.guildId);
+            if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+            const config = getGuildConfig(guild.id);
+            const current = config.modules && typeof config.modules === 'object' ? config.modules : {};
+            const modules = { ...current };
+            for (const key of MODULE_KEYS) {
+                if (req.body?.[key] !== undefined) modules[key] = parseBoolean(req.body[key], false);
+            }
+            setGuildConfig(guild.id, { modules });
+            res.json(APIResponse.success({ guildId: guild.id, modules }, 'Modules updated', 'MODULES_UPDATED'));
+        });
+
+        this.app.get('/guilds/:guildId/premium', async (req, res) => {
+            const guild = this.client.guilds.cache.get(req.params.guildId);
+            if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+            const limits = await premiumManager.getGuildFeatureLimits(guild.id, guild.ownerId);
+            const tierInfo = await premiumManager.getGuildTier(guild.id, guild.ownerId);
+            res.json(APIResponse.success({ guildId: guild.id, featureLimits: limits, ...tierInfo }, 'Premium fetched', 'PREMIUM_OK'));
+        });
+
+        // --- AutoMod ---
+        this.app.get('/guilds/:guildId/automod', (req, res) => {
+            const guild = this.client.guilds.cache.get(req.params.guildId);
+            if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+            const config = getGuildConfig(guild.id);
+            res.json(APIResponse.success({
+                guildId: guild.id,
+                automod: normalizeAutoModSettings(config.automod || {}),
+            }, 'AutoMod settings fetched', 'AUTOMOD_OK'));
+        });
+
+        this.app.post('/guilds/:guildId/automod', (req, res) => {
+            const guild = this.client.guilds.cache.get(req.params.guildId);
+            if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+            const automod = normalizeAutoModSettings(req.body || {});
+            setGuildConfig(guild.id, { automod });
+            res.json(APIResponse.success({ guildId: guild.id, automod }, 'AutoMod settings updated', 'AUTOMOD_UPDATED'));
+        });
+
+        // --- Welcome / Goodbye ---
+        this.app.get('/guilds/:guildId/welcome', (req, res) => {
+            const guild = this.client.guilds.cache.get(req.params.guildId);
+            if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+            const config = getGuildConfig(guild.id);
+            const welcome = config.welcome && typeof config.welcome === 'object' ? config.welcome : {};
+            res.json(APIResponse.success({ guildId: guild.id, welcome }, 'Welcome settings fetched', 'WELCOME_OK'));
+        });
+
+        this.app.post('/guilds/:guildId/welcome', (req, res) => {
+            const guild = this.client.guilds.cache.get(req.params.guildId);
+            if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+            const body = req.body || {};
+            const welcome = {
+                welcomeEnabled: parseBoolean(body.welcomeEnabled, true),
+                welcomeChannelId: String(body.welcomeChannelId || '').trim() || null,
+                welcomeMessage: String(body.welcomeMessage || '').slice(0, 2000),
+                welcomeAsEmbed: parseBoolean(body.welcomeAsEmbed, false),
+                welcomeEmbedTitle: String(body.welcomeEmbedTitle || '').slice(0, 256),
+                welcomeEmbedColor: String(body.welcomeEmbedColor || '').slice(0, 7),
+                welcomeCardEnabled: parseBoolean(body.welcomeCardEnabled, false),
+                welcomeCardTitle: String(body.welcomeCardTitle || '').slice(0, 256),
+                welcomeCardSubtitle: String(body.welcomeCardSubtitle || '').slice(0, 512),
+                aiWelcomeEnabled: parseBoolean(body.aiWelcomeEnabled, false),
+                aiCharacter: String(body.aiCharacter || 'friendly').slice(0, 32),
+                goodbyeEnabled: parseBoolean(body.goodbyeEnabled, false),
+                goodbyeChannelId: String(body.goodbyeChannelId || '').trim() || null,
+                goodbyeMessage: String(body.goodbyeMessage || '').slice(0, 2000),
+                goodbyeAsEmbed: parseBoolean(body.goodbyeAsEmbed, false),
+                autoroleEnabled: parseBoolean(body.autoroleEnabled, false),
+                autoroleId: String(body.autoroleId || '').trim() || null,
+            };
+            if (welcome.welcomeChannelId && !guild.channels.cache.get(welcome.welcomeChannelId)) {
+                return res.status(400).json(APIResponse.badRequest('Welcome channel not found'));
+            }
+            if (welcome.goodbyeChannelId && !guild.channels.cache.get(welcome.goodbyeChannelId)) {
+                return res.status(400).json(APIResponse.badRequest('Goodbye channel not found'));
+            }
+            if (welcome.autoroleId && !guild.roles.cache.has(welcome.autoroleId)) {
+                return res.status(400).json(APIResponse.badRequest('Autorole not found'));
+            }
+            setGuildConfig(guild.id, { welcome });
+            res.json(APIResponse.success({ guildId: guild.id, welcome }, 'Welcome settings updated', 'WELCOME_UPDATED'));
+        });
+
+        // --- Reaction Roles (Panel-Konfiguration; Versand siehe /reaction-roles/send weiter unten) ---
+        this.app.get('/guilds/:guildId/reaction-roles', (req, res) => {
+            const guild = this.client.guilds.cache.get(req.params.guildId);
+            if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+            const config = getGuildConfig(guild.id);
+            const panels = normalizeReactionRolePanels(config.reactionRoles || {});
+            res.json(APIResponse.success({ guildId: guild.id, panels }, 'Reaction role panels fetched', 'REACTION_ROLES_OK'));
+        });
+
+        this.app.post('/guilds/:guildId/reaction-roles', (req, res) => {
+            const guild = this.client.guilds.cache.get(req.params.guildId);
+            if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+            const config = getGuildConfig(guild.id);
+            const existing = config.reactionRoles && typeof config.reactionRoles === 'object' ? config.reactionRoles : {};
+            const incomingPanels = Array.isArray(req.body?.panels) ? req.body.panels : [];
+            const panels = normalizeReactionRolePanels({ panels: incomingPanels.length ? incomingPanels : existing.panels });
+            setGuildConfig(guild.id, { reactionRoles: { ...existing, panels } });
+            res.json(APIResponse.success({ guildId: guild.id, panels }, 'Reaction role panels updated', 'REACTION_ROLES_UPDATED'));
+        });
+
+        // --- Leveling ---
+        this.app.get('/guilds/:guildId/leveling', (req, res) => {
+            const guild = this.client.guilds.cache.get(req.params.guildId);
+            if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+            const config = getGuildConfig(guild.id);
+            res.json(APIResponse.success({
+                guildId: guild.id,
+                leveling: levelingManager.getLevelSettings(config),
+            }, 'Leveling settings fetched', 'LEVELING_OK'));
+        });
+
+        this.app.post('/guilds/:guildId/leveling', (req, res) => {
+            const guild = this.client.guilds.cache.get(req.params.guildId);
+            if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+            // getLevelSettings() clamped/normalisiert alle Werte -- so speichern wir nie
+            // ungueltige Rohdaten, unabhaengig davon was das Formular schickt.
+            const leveling = levelingManager.getLevelSettings({ leveling: req.body || {} });
+            setGuildConfig(guild.id, { leveling });
+            res.json(APIResponse.success({ guildId: guild.id, leveling }, 'Leveling settings updated', 'LEVELING_UPDATED'));
+        });
+
+        this.app.get('/guilds/:guildId/leveling/leaderboard', async (req, res) => {
+            const guild = this.client.guilds.cache.get(req.params.guildId);
+            if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+            const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 50));
+            const offset = Math.max(0, Number(req.query.offset) || 0);
+            const [leaderboard, total] = await Promise.all([
+                levelingManager.getLeaderboard(guild.id, limit, offset),
+                levelingManager.getLeaderboardTotal(guild.id),
+            ]);
+            res.json(APIResponse.success({ guildId: guild.id, leaderboard, total }, 'Leaderboard fetched', 'LEADERBOARD_OK'));
+        });
+
+        // --- Temp Voice ---
+        this.app.get('/guilds/:guildId/tempvoice', (req, res) => {
+            const guild = this.client.guilds.cache.get(req.params.guildId);
+            if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+            const config = getGuildConfig(guild.id);
+            const tempVoice = config.tempVoice && typeof config.tempVoice === 'object' ? config.tempVoice : {};
+            res.json(APIResponse.success({ guildId: guild.id, tempVoice }, 'Temp-voice settings fetched', 'TEMPVOICE_OK'));
+        });
+
+        this.app.post('/guilds/:guildId/tempvoice', (req, res) => {
+            const guild = this.client.guilds.cache.get(req.params.guildId);
+            if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+            const body = req.body || {};
+            const hubChannelId = String(body.hubChannelId || '').trim() || null;
+            const categoryId = String(body.categoryId || '').trim() || null;
+            if (hubChannelId && guild.channels.cache.get(hubChannelId)?.type !== 2) {
+                return res.status(400).json(APIResponse.badRequest('Hub channel must be a voice channel'));
+            }
+            if (categoryId && guild.channels.cache.get(categoryId)?.type !== 4) {
+                return res.status(400).json(APIResponse.badRequest('Category not found'));
+            }
+            const tempVoice = {
+                enabled: parseBoolean(body.enabled, false),
+                hubChannelId,
+                categoryId,
+                channelNameTemplate: String(body.channelNameTemplate || "{username}'s Channel").slice(0, 90),
+                userLimit: Math.max(0, Math.min(99, Number(body.userLimit) || 0)),
+                bitrate: Math.max(0, Math.min(384, Number(body.bitrate) || 0)),
+                allowRename: parseBoolean(body.allowRename, true),
+                allowLock: parseBoolean(body.allowLock, true),
+                allowLimit: parseBoolean(body.allowLimit, true),
+                deleteWhenEmpty: parseBoolean(body.deleteWhenEmpty, true),
+            };
+            setGuildConfig(guild.id, { tempVoice });
+            res.json(APIResponse.success({ guildId: guild.id, tempVoice }, 'Temp-voice settings updated', 'TEMPVOICE_UPDATED'));
+        });
+
+        // --- Moderation: Fall-Historie ---
+        this.app.get('/guilds/:guildId/moderation/cases', async (req, res) => {
+            const guild = this.client.guilds.cache.get(req.params.guildId);
+            if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+            const { getPool } = require('../utils/db');
+            const pool = getPool();
+            const page = Math.max(1, Number(req.query.page) || 1);
+            const pageSize = Math.max(1, Math.min(100, Number(req.query.pageSize) || 20));
+            const typeArg = req.query.type ? String(req.query.type) : null;
+            const userIdArg = req.query.userId ? String(req.query.userId) : null;
+
+            const params = [guild.id];
+            let where = 'guild_id = ?';
+            if (typeArg) { where += ' AND type = ?'; params.push(typeArg); }
+            if (userIdArg) { where += ' AND user_id = ?'; params.push(userIdArg); }
+
+            const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total FROM moderation_cases WHERE ${where}`, params);
+            const totalCount = Number(total) || 0;
+            const queryParams = [...params, pageSize, (page - 1) * pageSize];
+            const [rows] = await pool.query(
+                `SELECT id, user_id, moderator_id, type, reason, status, duration_ms, expires_at, created_at, updated_at
+                 FROM moderation_cases WHERE ${where}
+                 ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+                queryParams
+            );
+            res.json(APIResponse.success({
+                guildId: guild.id, cases: rows, total: totalCount, page, pageSize,
+            }, 'Moderation cases fetched', 'MODERATION_CASES_OK'));
         });
 
         // Minimale Verwaltungs-API fuer Reaction-Role-Panels, solange es noch kein eigenes
