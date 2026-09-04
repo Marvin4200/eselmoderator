@@ -10,12 +10,12 @@ const { initDb } = require("./utils/db");
 const premiumManager = require("./utils/premiumManager");
 const BotAPIServer = require("./services/botAPI");
 
+// Nur das noetigste Intent fuer Phase 1 (Login + Guild-Liste). GuildMembers/MessageContent
+// sind privilegierte Intents, die erst im Discord Developer Portal manuell freigeschaltet
+// werden muessen -- kommen dazu, sobald Phase 2/3 Features sie tatsaechlich brauchen.
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
     ],
 });
 
