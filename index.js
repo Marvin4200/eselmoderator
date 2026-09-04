@@ -28,6 +28,8 @@ const {
     syncLevelRolesForMember,
 } = require("./utils/leveling");
 const ticketManager = require("./utils/ticketManager");
+const socialNotifier = require("./utils/socialNotifier");
+const freeGamesNotifier = require("./utils/freeGamesNotifier");
 const premiumManager = require("./utils/premiumManager");
 const BotAPIServer = require("./services/botAPI");
 const { commands, handleInteraction } = require("./commands/index");
@@ -99,6 +101,8 @@ client.once(Events.ClientReady, async () => {
     await syncSlashCommands();
     updatePresence();
     activeIntervals.push(setInterval(updatePresence, 10 * 60 * 1000));
+    socialNotifier.start(client);
+    freeGamesNotifier.start(client);
 });
 
 client.on(Events.InteractionCreate, (interaction) => {
@@ -426,6 +430,8 @@ main().catch((err) => {
 async function shutdown() {
     console.log("\n🛑 Shutdown signal received...");
     activeIntervals.forEach((interval) => clearInterval(interval));
+    socialNotifier.stop();
+    freeGamesNotifier.stop();
     client.destroy();
     process.exit(0);
 }

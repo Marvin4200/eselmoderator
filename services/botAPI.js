@@ -25,8 +25,10 @@ const premiumManager = require('../utils/premiumManager');
 const { normalizeAutoModSettings } = require('../utils/automod');
 const levelingManager = require('../utils/levelingManager');
 const { parseBoolean } = require('../utils/valueParsers');
+const socialNotifier = require('../utils/socialNotifier');
+const freeGamesNotifier = require('../utils/freeGamesNotifier');
 
-const MODULE_KEYS = ['moderation', 'automod', 'welcome', 'reactionRoles', 'leveling', 'tempVoice', 'tickets'];
+const MODULE_KEYS = ['moderation', 'automod', 'welcome', 'reactionRoles', 'leveling', 'tempVoice', 'tickets', 'social'];
 
 function discordImageUrl(value) {
     const url = String(value || '').trim();
@@ -349,6 +351,81 @@ class BotAPIServer {
             };
             setGuildConfig(guild.id, { tempVoice });
             res.json(APIResponse.success({ guildId: guild.id, tempVoice }, 'Temp-voice settings updated', 'TEMPVOICE_UPDATED'));
+        });
+
+        // --- Social Alerts (Twitch/YouTube/RSS) ---
+        this.app.get('/guilds/:guildId/social', (req, res) => {
+            const guild = this.client.guilds.cache.get(req.params.guildId);
+            if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+            const config = getGuildConfig(guild.id);
+            res.json(APIResponse.success({
+                guildId: guild.id,
+                social: socialNotifier.normalizeSettings(config),
+            }, 'Social settings fetched', 'SOCIAL_OK'));
+        });
+
+        this.app.post('/guilds/:guildId/social', (req, res) => {
+            const guild = this.client.guilds.cache.get(req.params.guildId);
+            if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+            const body = req.body || {};
+            if (body.announcementChannelId && guild.channels.cache.get(body.announcementChannelId)?.type !== 0) {
+                return res.status(400).json(APIResponse.badRequest('Announcement channel not found'));
+            }
+            const social = socialNotifier.normalizeSettings({ social: body });
+            setGuildConfig(guild.id, { social });
+            res.json(APIResponse.success({ guildId: guild.id, social }, 'Social settings updated', 'SOCIAL_UPDATED'));
+        });
+
+        // --- Freegames Notifier ---
+        this.app.get('/guilds/:guildId/freegames', (req, res) => {
+            const guild = this.client.guilds.cache.get(req.params.guildId);
+            if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+            const config = getGuildConfig(guild.id);
+            res.json(APIResponse.success({
+                guildId: guild.id,
+                freeGames: freeGamesNotifier.normalizeFreeGamesConfig(config),
+            }, 'Freegames settings fetched', 'FREEGAMES_OK'));
+        });
+
+        this.app.post('/guilds/:guildId/freegames', (req, res) => {
+            const guild = this.client.guilds.cache.get(req.params.guildId);
+            if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+            const body = req.body || {};
+            if (body.channelId && guild.channels.cache.get(body.channelId)?.type !== 0) {
+                return res.status(400).json(APIResponse.badRequest('Channel not found'));
+            }
+            if (body.mentionRoleId && !guild.roles.cache.has(body.mentionRoleId)) {
+                return res.status(400).json(APIResponse.badRequest('Mention role not found'));
+            }
+            const existing = getGuildConfig(guild.id);
+            const current = freeGamesNotifier.normalizeFreeGamesConfig(existing);
+            const freeGames = freeGamesNotifier.normalizeFreeGamesConfig({
+                freeGames: {
+                    ...current,
+                    enabled: parseBoolean(body.enabled, false),
+                    channelId: String(body.channelId || '').trim() || null,
+                    mentionRoleId: String(body.mentionRoleId || '').trim() || null,
+                    filter: body.filter === 'serious' ? 'serious' : 'all',
+                },
+            });
+            setGuildConfig(guild.id, { freeGames });
+            res.json(APIResponse.success({ guildId: guild.id, freeGames }, 'Freegames settings updated', 'FREEGAMES_UPDATED'));
+        });
+
+        this.app.post('/guilds/:guildId/freegames/post-now', async (req, res) => {
+            try {
+                const guild = this.client.guilds.cache.get(req.params.guildId);
+                if (!guild) return res.status(404).json(APIResponse.notFound('Guild not found'));
+                const config = getGuildConfig(guild.id);
+                const settings = freeGamesNotifier.normalizeFreeGamesConfig(config);
+                if (!settings.channelId) return res.status(400).json(APIResponse.badRequest('Kein Kanal konfiguriert'));
+                const channel = guild.channels.cache.get(settings.channelId) || await guild.channels.fetch(settings.channelId).catch(() => null);
+                if (!channel?.isTextBased?.()) return res.status(400).json(APIResponse.badRequest('Kanal nicht gefunden'));
+                const count = await freeGamesNotifier.postToChannel(channel);
+                res.json(APIResponse.success({ guildId: guild.id, posted: count }, 'Freegames posted', 'FREEGAMES_POSTED'));
+            } catch (error) {
+                res.status(500).json(APIResponse.error(error.message, 'FREEGAMES_POST_FAILED'));
+            }
         });
 
         // --- Moderation: Fall-Historie ---
