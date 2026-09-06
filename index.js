@@ -63,17 +63,25 @@ const activeIntervals = [];
 
 // Guild-Command-Registrierung statt global: Aenderungen sind sofort sichtbar (global
 // braucht bis zu einer Stunde) -- praktisch waehrend Phase 2/3 noch viele Commands dazukommen.
-async function syncSlashCommands() {
+// WICHTIG: syncSlashCommands() laeuft nur einmal beim Start ueber die zu diesem Zeitpunkt
+// bekannten Guilds -- ohne den guildCreate-Handler unten haette ein frisch eingeladener Server
+// (z.B. ein top.gg-Pruefer, der den Bot gerade erst hinzufuegt) bis zum naechsten Deploy/Neustart
+// ueberhaupt keine Slash-Commands gesehen.
+async function registerCommandsForGuild(guild) {
     const token = process.env.DISCORD_TOKEN;
     const rest = new REST({ version: "10" }).setToken(token);
     const body = commands.map(c => c.toJSON());
+    try {
+        await rest.put(Routes.applicationGuildCommands(client.user.id, guild.id), { body });
+        console.log(`✓ Slash-Commands synced fuer ${guild.name}`);
+    } catch (err) {
+        console.error(`❌ Slash-Command-Sync fehlgeschlagen fuer ${guild.name}:`, err.message);
+    }
+}
+
+async function syncSlashCommands() {
     for (const guild of client.guilds.cache.values()) {
-        try {
-            await rest.put(Routes.applicationGuildCommands(client.user.id, guild.id), { body });
-            console.log(`✓ Slash-Commands synced fuer ${guild.name}`);
-        } catch (err) {
-            console.error(`❌ Slash-Command-Sync fehlgeschlagen fuer ${guild.name}:`, err.message);
-        }
+        await registerCommandsForGuild(guild);
     }
 }
 
@@ -116,6 +124,14 @@ client.once(Events.ClientReady, async () => {
         }
     }, 60000); // every minute
     activeIntervals.push(scheduledDiscordBackups);
+});
+
+// Ohne diesen Handler blieb ein frisch eingeladener Server komplett ohne Slash-Commands, bis der
+// Bot-Prozess das naechste Mal neu startet -- siehe Kommentar bei registerCommandsForGuild oben.
+client.on(Events.GuildCreate, (guild) => {
+    registerCommandsForGuild(guild).catch((err) => {
+        console.error(`❌ Slash-Command-Sync fuer neu beigetretenen Server ${guild.name} fehlgeschlagen:`, err.message);
+    });
 });
 
 client.on(Events.InteractionCreate, (interaction) => {
